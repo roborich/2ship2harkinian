@@ -27,13 +27,19 @@ slowTest("the loop ticks at 60 / R_UPDATE_RATE Hz, within 5%", () =>
 // One rendered frame per game tick. Interpolated sub-frames need a loop paced by the display
 // to be seen; this one ticks at the game's rate, so they would be drawn back to back and
 // only the last would reach the screen, at up to three times the cost of a tick.
-slowTest("60 fps interpolation still draws one frame per tick", () => {
+//
+// gInterpolationFPS is what a config carried over from a desktop install sets. drawsPerTick
+// alone cannot catch a regression here, because Graph_ProcessGfxCommands pins the browser's
+// draw rate on its own; the interpolationFps assertion is what proves the config did not
+// switch interpolation -- and the per-frame matrix recording it drives -- back on.
+slowTest("a desktop config's 60 fps interpolation is ignored", () => {
     const config = playConfig();
-    config.CVars.gSettings = { ...config.CVars.gSettings, InterpolationFPS: 60 };
+    config.CVars.gInterpolationFPS = 60;
     return withGame(suite, { inlineFiles: playFiles(config) }, async (game) => {
         await game.waitForEvent("scene", { timeout: BOOT_TIMEOUT });
         await Bun.sleep(3000);
         const samples = await game.sampleStats(6000);
         expect(drawsPerTick(samples)).toBeCloseTo(1, 1);
+        expect(samples.filter((s) => s.interpolationFps !== 20)).toEqual([]);
     });
 }, TEST_TIMEOUT);

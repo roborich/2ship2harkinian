@@ -859,6 +859,16 @@ ImFont* OTRGlobals::CreateDefaultFontWithSize(float size) {
 }
 
 uint32_t OTRGlobals::GetInterpolationFPS() {
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] The browser build draws one frame per game tick (see Graph_ProcessGfxCommands,
+    // which pins the draw count itself), so interpolation has nothing to act on. What this saves
+    // is the work upstream of the draw: 20 is the value FrameInterpolation_StartRecord reads as
+    // "not interpolating", so without it every frame builds a matrix/gfx-op recording tree that
+    // nothing consumes, and z_kankyo.c takes a slower projection-matrix path for skybox stars.
+    // Returning it here also closes that off for a host-supplied desktop config, which the
+    // hidden UI widgets cannot.
+    return 20;
+#endif
     if (CVarGetInteger("gMatchRefreshRate", 0)) {
         return Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
     } else if (CVarGetInteger(CVAR_VSYNC_ENABLED, 1) ||
@@ -1362,6 +1372,8 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
     // display to be seen; this one ticks at the game's rate (graph.c), so they would be drawn
     // back to back and only the last would reach the screen, at up to three times the cost of
     // a tick.
+    // Deliberately redundant with GetInterpolationFPS() returning 20 here: keep it, so the
+    // browser's draw rate says what it is instead of depending on the == 20 branch below.
     int target_fps = 60 / R_UPDATE_RATE;
 #else
     int target_fps = OTRGlobals::Instance->GetInterpolationFPS();

@@ -620,6 +620,9 @@ void BenMenu::AddSettings() {
                 .DefaultValue(1));
 #endif
 
+#ifndef __EMSCRIPTEN__
+    // 2S2H [WASM] The browser build draws one frame per game tick and the page's timer paces it,
+    // not the display, so frame interpolation and VSync have nothing to act on there.
     AddWidget(path, "Current FPS: %d", WIDGET_CVAR_SLIDER_INT)
         .CVar("gInterpolationFPS")
         .Callback([](WidgetInfo& info) {
@@ -642,13 +645,16 @@ void BenMenu::AddSettings() {
     AddWidget(path, "Match Refresh Rate", WIDGET_CVAR_CHECKBOX)
         .CVar("gMatchRefreshRate")
         .Options(CheckboxOptions().Tooltip("Matches interpolation value to the refresh rate of your display."));
+#endif
     AddWidget(path, "Renderer API (Needs reload)", WIDGET_VIDEO_BACKEND);
+#ifndef __EMSCRIPTEN__
     AddWidget(path, "Enable Vsync", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_VSYNC_ENABLED)
         .PreFunc([](WidgetInfo& info) { info.isHidden = mBenMenu->disabledMap.at(DISABLE_FOR_NO_VSYNC).active; })
         .Options(CheckboxOptions()
                      .Tooltip("Removes tearing, but clamps your max FPS to your displays refresh rate.")
                      .DefaultValue(true));
+#endif
     AddWidget(path, "Windowed Fullscreen", WIDGET_CVAR_CHECKBOX)
         .CVar(CVAR_SDL_WINDOWED_FULLSCREEN)
         .PreFunc([](WidgetInfo& info) {

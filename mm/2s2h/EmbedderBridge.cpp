@@ -18,6 +18,7 @@ extern "C" {
 #include "variables.h"
 extern PlayState* gPlayState;
 int AudioPlayer_Buffered(void);
+uint32_t Ship_GetInterpolationFPS(void);
 }
 
 // ---- AddressSanitizer ---------------------------------------------------------------------
@@ -218,12 +219,15 @@ void Ship_EmbedderCountAudioDrop(void) {
 }
 
 // Returns a JSON object, valid until the next call. updateRate is R_UPDATE_RATE, the game's
-// vsync divisor; sceneId is -1 outside a play state.
+// vsync divisor; sceneId is -1 outside a play state. interpolationFps is what the frame
+// interpolator asks for, and 20 means it is switched off -- this build always reports 20, so a
+// host-supplied config cannot turn the recording work back on.
 extern "C" EMSCRIPTEN_KEEPALIVE const char* Ship_GetStats(void) {
     static std::string json;
-    json = fmt::format(R"({{"ticks":{},"draws":{},"updateRate":{},"audioBuffered":{},"audioDrops":{},"sceneId":{}}})",
-                       sTicks, sDraws, R_UPDATE_RATE, AudioPlayer_Buffered(), sAudioDrops,
-                       gPlayState != nullptr ? gPlayState->sceneId : -1);
+    json = fmt::format(
+        R"({{"ticks":{},"draws":{},"updateRate":{},"audioBuffered":{},"audioDrops":{},"sceneId":{},"interpolationFps":{}}})",
+        sTicks, sDraws, R_UPDATE_RATE, AudioPlayer_Buffered(), sAudioDrops,
+        gPlayState != nullptr ? gPlayState->sceneId : -1, Ship_GetInterpolationFPS());
     return json.c_str();
 }
 

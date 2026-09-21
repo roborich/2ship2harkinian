@@ -560,7 +560,11 @@ void UpdateResolutionVars() {
 bool IsDroppingFrames() {
     // a rather imprecise way of checking for frame drops.
     // but it's mostly there to inform the player of large drops.
-    const short targetFPS = CVarGetInteger("gInterpolationFPS", 20);
+    // Ask for the rate actually being targeted, not the raw CVar: GetInterpolationFPS clamps to
+    // the refresh rate when Match Refresh Rate or VSync is on, and pins 20 in the browser build.
+    // Reading the CVar meant a target above the refresh rate (or a config carried into a build
+    // that ignores it) left this warning on permanently.
+    const short targetFPS = OTRGlobals::Instance->GetInterpolationFPS();
     const float threshold = targetFPS / 20.0f + 4.1f;
     return ImGui::GetIO().Framerate < targetFPS - threshold;
 }

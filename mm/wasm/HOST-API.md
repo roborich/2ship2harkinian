@@ -80,15 +80,17 @@ For tests and profiling, not for building on: the fields can change without noti
 
 ```js
 JSON.parse(Module.ccall('Ship_GetStats', 'string'));
-// { ticks, draws, updateRate, audioBuffered, audioDrops, sceneId }
+// { ticks, draws, updateRate, audioBuffered, audioDrops, interpolationFps, sceneId }
 ```
 
-`ticks` counts frame-loop callbacks and `draws` the frames drawn in them; more than one draw
-per tick means frame interpolation is on. `updateRate` is the game's vsync divisor (the loop
+`ticks` counts frame-loop callbacks and `draws` the frames drawn in them; this build pins one
+draw per tick, so anything else is a regression. `updateRate` is the game's vsync divisor (the loop
 runs at `60 / updateRate` Hz — 3 in gameplay, 2 in the pause menu and message boxes, 1 on the
 title, file select, opening and "Dawn of the Nth Day" screens). `audioBuffered` is the number
 of samples queued for the audio device, and `audioDrops` the updates discarded because that
-queue was already full. `sceneId` is `-1` outside a play state.
+queue was already full. `interpolationFps` is the frame interpolator's target; `20` means off,
+and this build always reports 20 whatever the config asks for. `sceneId` is `-1` outside a play
+state.
 
 ## 5. Converting a ROM
 

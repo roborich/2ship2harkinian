@@ -7,6 +7,7 @@ export type StatsSample = {
     updateRate: number;
     audioBuffered: number;
     audioDrops: number;
+    interpolationFps: number; // 20 means frame interpolation is off
 };
 
 export type RateSegment = { updateRate: number; durationMs: number; measuredHz: number; expectedHz: number; error: number };

@@ -61,7 +61,10 @@ through the `error` event rather than failing at the first resource load.
   logger and the streamed-sample decoders all run inline.
 - **One rendered frame per game tick.** Interpolated sub-frames need a loop paced by the
   display to be seen; this one ticks at the game's rate, so they would be drawn back to back
-  and only the last would reach the screen. `InterpolationFPS` therefore has no effect.
+  and only the last would reach the screen. `gInterpolationFPS`, `gMatchRefreshRate` and
+  `gSettings.VsyncEnabled` are therefore ignored here and their settings hidden — a config
+  carried over from a desktop install cannot switch interpolation, or the per-frame matrix
+  recording that drives it, back on. `Ship_GetStats` reports `interpolationFps: 20` to confirm.
 - **The frame rate is the game's, not the display's.** The loop is driven by
   `emscripten_set_main_loop` at `60 / R_UPDATE_RATE` Hz, re-derived after every frame:
   20 Hz in gameplay, 30 in the pause menu and message boxes, 60 on the title, file select and
