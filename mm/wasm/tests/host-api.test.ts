@@ -1,0 +1,78 @@
+import { expect, test } from "bun:test";
+import { playFiles } from "./lib/configs";
+import { BOOT_TIMEOUT, TEST_TIMEOUT } from "./lib/env";
+import { type Game } from "./lib/game";
+import { useSuite, withGame } from "./lib/suite";
+import { documentedEventTypes, emittedEventTypes } from "./lib/contract";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { REPO_DIR } from "./lib/env";
+
+// mm/wasm/HOST-API.md is the spec for everything in this file.
+const suite = useSuite();
+
+const bootToScene = (game: Game) => game.waitForEvent("scene", { timeout: BOOT_TIMEOUT });
+
+test("every event the bridge sends is documented, and every documented one is sent", () => {
+    const bridge = readFileSync(join(REPO_DIR, "mm/2s2h/EmbedderBridge.cpp"), "utf8");
+    const hostApi = readFileSync(join(REPO_DIR, "mm/wasm/HOST-API.md"), "utf8");
+    expect(emittedEventTypes(bridge)).toEqual(documentedEventTypes(hostApi));
+});
+
+test("an unknown command returns -2 and a known one returns 0", () =>
+    withGame(suite, { inlineFiles: playFiles() }, async (game) => {
+        await bootToScene(game);
+        expect(await game.run("no_such_command")).toBe(-2);
+        expect(await game.run("reload")).toBe(0);
+    }), TEST_TIMEOUT);
+
+// MM's vocabulary, not OoT's: the three-day cycle rather than an age and a time of day.
+test("a scene event carries MM's own fields", () =>
+    withGame(suite, { inlineFiles: playFiles() }, async (game) => {
+        const { event } = await bootToScene(game);
+        expect(typeof event.sceneId).toBe("number");
+        expect(typeof event.spawnNum).toBe("number");
+        expect(typeof event.entrance).toBe("number");
+        expect(typeof event.day).toBe("number");
+        expect(typeof event.time).toBe("number");
+        expect(typeof event.isNight).toBe("boolean");
+        expect(typeof event.playerForm).toBe("number");
+    }), TEST_TIMEOUT);
+
+test("Ship_GetStats reports a running loop", () =>
+    withGame(suite, { inlineFiles: playFiles() }, async (game) => {
+        await bootToScene(game);
+        const first = await game.stats();
+        await Bun.sleep(2000);
+        const second = await game.stats();
+        expect(second.ticks).toBeGreaterThan(first.ticks);
+        expect([1, 2, 3]).toContain(second.updateRate);
+        expect(second.draws).toBeGreaterThan(first.draws);
+    }), TEST_TIMEOUT);
+
+// A listener runs inside dispatchEvent; the bridge holds events until after the frame that
+// raised them, so a command sent from a listener acts on a settled game rather than a
+// half-updated one.
+test("a command sent from inside an event listener is accepted", () =>
+    withGame(suite, { inlineFiles: playFiles() }, async (game) => {
+        await bootToScene(game);
+        await game.armCommandOnEvent("scene", "reload");
+        const from = await game.eventCount();
+        expect(await game.run("reload")).toBe(0);
+        await game.waitForEvent("scene", { from, timeout: 30_000 });
+        await game.waitUntil(async () => (await game.listenerResults()).length > 0, "the listener's command to run", 30_000);
+        expect(await game.listenerResults()).toEqual([0]);
+    }), TEST_TIMEOUT);
+
+// The page owns storage: the module writes into MEMFS and reports what changed, so the host
+// can persist it. Files the host supplied at boot are not echoed back.
+test("the config the game writes comes back as a file-saved event", () =>
+    withGame(suite, { inlineFiles: playFiles() }, async (game) => {
+        await bootToScene(game);
+        const saved = await game.waitForEvent("file-saved", {
+            match: (e) => e.path === "/2ship2harkinian.json",
+            timeout: 60_000,
+        });
+        expect(saved.event.byteLength).toBeGreaterThan(0);
+        expect(JSON.parse((await game.savedText("/2ship2harkinian.json"))!)).toHaveProperty("CVars");
+    }), TEST_TIMEOUT);

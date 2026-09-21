@@ -910,8 +910,27 @@ static void OTRAudio_FillBuffer() {
     int samples_left = AudioPlayer_Buffered();
     u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
 
+    // 2S2H [WASM] audio_buffer holds MAX_AUDIO_FRAMES_PER_UPDATE updates and no more, but
+    // the loop below is bounded by AUDIO_FRAMES_PER_UPDATE, which is R_UPDATE_RATE -- a
+    // value the game writes (SREG(30)) and nothing here validates. Anything above 3 would
+    // overrun this stack buffer.
+    //
+    // Belt and braces: every divisor this game actually sets is 1, 2 or 3, and instrumenting
+    // the clamp showed it never fires, so it is not the cause of the audio crash described
+    // in wasm-port.md. It is kept because the bound is real and the buffer is on the stack.
+    s32 frames_per_update = AUDIO_FRAMES_PER_UPDATE;
+    if (frames_per_update > MAX_AUDIO_FRAMES_PER_UPDATE) {
+        static bool sReported = false;
+        if (!sReported) {
+            sReported = true;
+            SPDLOG_ERROR("R_UPDATE_RATE is {}, above the {} this buffer holds; clamping", frames_per_update,
+                         MAX_AUDIO_FRAMES_PER_UPDATE);
+        }
+        frames_per_update = MAX_AUDIO_FRAMES_PER_UPDATE;
+    }
+
     s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS * MAX_AUDIO_FRAMES_PER_UPDATE];
-    for (int i = 0; i < AUDIO_FRAMES_PER_UPDATE; i++) {
+    for (int i = 0; i < frames_per_update; i++) {
         AudioMgr_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * NUM_AUDIO_CHANNELS), num_audio_samples);
     }
 
@@ -922,7 +941,7 @@ static void OTRAudio_FillBuffer() {
     }
 #endif
     AudioPlayer_Play((u8*)audio_buffer,
-                     num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS * AUDIO_FRAMES_PER_UPDATE));
+                     num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS * frames_per_update));
 }
 
 void OTRAudio_Thread() {

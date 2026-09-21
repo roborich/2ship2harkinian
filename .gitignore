@@ -74,3 +74,6 @@ _packages/
 
 build/
 .cache
+# 2S2H [WASM] test harness
+mm/wasm/tests/node_modules/
+mm/wasm/tests/results/
