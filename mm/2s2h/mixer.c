@@ -16,10 +16,33 @@
 #define ROUND_UP_8(v) (((v) + 7) & ~7)
 #define ROUND_DOWN_16(v) ((v) & ~0xf)
 
-//#define DMEM_BUF_SIZE (0x1000 - 0x0330 - 0x10 - 0x40)
-#define DMEM_BUF_SIZE 0xC80
-#define BUF_U8(a) (rspa.buf.as_u8 + ((a)-0x0330))
-#define BUF_S16(a) (rspa.buf.as_s16 + ((a)-0x0330) / sizeof(int16_t))
+// 2S2H [WASM] The emulated RSP DMEM window. It used to be 0xC80 bytes biased by -0x0330,
+// exactly covering the 0x0330..0x0FB0 range the audio ucode's DMEM map uses -- which is
+// correct right up until a command asks for more than fits, or for an address outside the
+// map. On hardware the RSP cannot reach past DMEM at all. Here the window is a static
+// struct, so an oversized command runs off the end of it into whatever globals the linker
+// put next, and a below-0x0330 address indexes *before* it.
+//
+// That is not hypothetical. AddressSanitizer caught a 21,600-byte aClearBuffer against the
+// 2,624 bytes left above DMEM_UNCOMPRESSED_NOTE, from the CODEC_S16 / CODEC_OPUS branch of
+// AudioSynth_ProcessSample, spraying ~19 KB across the neighbouring audio globals. The
+// visible damage was an sfx bank's linked list turning circular (which hangs the frame loop,
+// and so the whole browser tab) and gAudioCtx's message queues going to garbage (an
+// out-of-bounds read inside osRecvMesg, a minute or so later).
+//
+// Rather than bounds-check all 28 of the aXxxImpl shims by hand, the window is sized to
+// cover every address a 16-bit DMEM address can name, plus the largest transfer any command
+// can request. A uint16_t address (max 0xFFFF) plus a uint16_t count (max 0xFFFF) is 0x1FFFE,
+// so nothing addressable can reach outside 0x20000 and the bias is gone with the negative
+// offsets it allowed. The few entry points that take a signed count are clamped below.
+// Legitimate traffic is unaffected: the ucode's map still lands at the same offsets, in the
+// same order, and the extra 128 KB is static.
+//
+// This bounds the damage. It does not explain the oversized request -- see wasm-port.md,
+// "The audio overrun".
+#define DMEM_BUF_SIZE 0x20000
+#define BUF_U8(a) (rspa.buf.as_u8 + (a))
+#define BUF_S16(a) (rspa.buf.as_s16 + (a) / sizeof(int16_t))
 
 static struct {
     uint16_t in;
@@ -90,18 +113,39 @@ static inline int32_t clamp32(int64_t v) {
     return (int32_t)v;
 }
 
+// Clamps a signed byte count to what is left of the window above addr. See the note on
+// DMEM_BUF_SIZE: unsigned counts cannot overrun the window at all, so only the signed ones
+// come through here.
+static int DmemClampBytes(uint16_t addr, int nbytes) {
+    if (nbytes <= 0) {
+        return 0;
+    }
+    if (nbytes > DMEM_BUF_SIZE - (int)addr) {
+        return DMEM_BUF_SIZE - (int)addr;
+    }
+    return nbytes;
+}
+
 void aClearBufferImpl(uint16_t addr, int nbytes) {
-    nbytes = ROUND_UP_16(nbytes);
+    nbytes = DmemClampBytes(addr, ROUND_UP_16(nbytes));
+    if (nbytes == 0) {
+        return;
+    }
     memset(BUF_U8(addr), 0, nbytes);
 }
 
 void aLoadBufferImpl(const void* source_addr, uint16_t dest_addr, uint16_t nbytes) {
+    int count = DmemClampBytes(dest_addr, ROUND_DOWN_16(nbytes));
+
+    if (count == 0) {
+        return;
+    }
 #if __SANITIZE_ADDRESS__
-    for (size_t i = 0; i < ROUND_DOWN_16(nbytes); i++) {
+    for (int i = 0; i < count; i++) {
         BUF_U8(dest_addr)[i] = ((const unsigned char*)source_addr)[i];
     }
 #else
-    memcpy(BUF_U8(dest_addr), source_addr, ROUND_DOWN_16(nbytes));
+    memcpy(BUF_U8(dest_addr), source_addr, count);
 #endif
 }
 
@@ -195,7 +239,10 @@ void aInterleaveImpl(uint16_t dest, uint16_t left, uint16_t right, uint16_t c) {
 }
 
 void aDMEMMoveImpl(uint16_t in_addr, uint16_t out_addr, int nbytes) {
-    nbytes = ROUND_UP_16(nbytes);
+    nbytes = DmemClampBytes(out_addr > in_addr ? out_addr : in_addr, ROUND_UP_16(nbytes));
+    if (nbytes == 0) {
+        return;
+    }
     memmove(BUF_U8(out_addr), BUF_U8(in_addr), nbytes);
 }
 

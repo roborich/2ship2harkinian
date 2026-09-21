@@ -26,11 +26,21 @@ static const Migration version1Migrations[] = {
 };
 
 static bool HasDisplayOverlayModeInConfig(Ship::Config* conf) {
-    if (!conf->GetNestedJson().contains("CVars")) {
+    // Config::GetNestedJson() returns by value, so `const auto& x = conf->GetNestedJson()[k]`
+    // binds a reference into a temporary that is destroyed at the end of that statement --
+    // lifetime extension does not reach a subobject obtained through a member call. Every
+    // read through it afterwards is a use-after-free. Hold the value instead.
+    //
+    // Desktop builds read the freed bytes and usually find them intact; the browser build's
+    // allocator does not oblige, and AddressSanitizer reports it at startup as
+    // "heap-use-after-free ... in Ben::ConfigVersion1Updater::Update".
+    const nlohmann::json nested = conf->GetNestedJson();
+
+    if (!nested.contains("CVars")) {
         return false;
     }
 
-    const auto& cvars = conf->GetNestedJson()["CVars"];
+    const auto& cvars = nested["CVars"];
     return cvars.contains("gDisplayOverlay") && cvars["gDisplayOverlay"].is_object() &&
            cvars["gDisplayOverlay"].contains("Mode");
 }

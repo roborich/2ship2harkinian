@@ -20,6 +20,27 @@ extern PlayState* gPlayState;
 int AudioPlayer_Buffered(void);
 }
 
+// ---- AddressSanitizer ---------------------------------------------------------------------
+// Compiled only into an `-fsanitize=address` build, where it is the one supported way to set
+// ASAN_OPTIONS: a browser has no environment to read them from.
+//
+//   halt_on_error=0             report every fault and keep going, so one run of the game
+//                               collects the whole list instead of one item per relink
+//                               (an ASan link of this module takes about ten minutes)
+//   detect_container_overflow=0 the std::vector annotations need every translation unit that
+//                               touches the container to be instrumented, which is not true
+//                               of the FetchContent dependencies; prism's shader header
+//                               parser reports one and it is a known false-positive shape
+//
+// Remove either when chasing something it hides.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+extern "C" const char* __asan_default_options(void) {
+    return "halt_on_error=0:detect_container_overflow=0:print_stacktrace=1";
+}
+#endif
+#endif
+
 // ---- outbound ----------------------------------------------------------------------------
 // A listener runs inside dispatchEvent, synchronously, and may call Ship_RunConsoleCommand.
 // Inside the frame that raised the event, that command would act on a half-updated game: a

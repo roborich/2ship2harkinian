@@ -363,20 +363,14 @@ void AudioSfx_RemoveBankEntry(u8 bankId, u8 entryIndex) {
     SfxBankEntry* entry = &gSfxBanks[bankId][entryIndex];
     u8 i;
 
-    // 2S2H [WASM] Refuse to unlink the list sentinel, or to follow a link that is outside
-    // the bank. Entry 0 is the head sentinel, not a real entry: AudioSfx_Reset gives it
-    // prev = next = 0xFF and every traversal starts at gSfxBanks[bankId][0].next. Removing
-    // it writes gSfxBanks[bankId][entry->prev] with prev == 0xFF -- 255 entries past a bank
-    // that is 5 to 12 entries long -- and then puts index 0 on the free list, after which
-    // the next removal sets the sentinel's own next to 0. That self-link makes
-    // AudioSfx_ChooseActiveSfx's `while (entryIndex != 0xFF)` walk spin forever, which in a
-    // browser tab wedges the whole page: the frame loop never returns to the event loop, so
-    // nothing renders, no input arrives and there is no error to report.
+    // 2S2H [WASM] Refuse to unlink the list sentinel, or to follow a link outside the bank.
+    // Entry 0 is the head sentinel, not a real entry: AudioSfx_Reset gives it
+    // prev = next = 0xFF and every traversal starts at gSfxBanks[bankId][0].next. Removing it
+    // would write gSfxBanks[bankId][entry->prev] with prev == 0xFF -- 255 entries past a bank
+    // of 5 to 12 -- turning one corrupt bank into a corrupt neighbourhood.
     //
-    // Observed only in the browser build, booting to a warp point in Termina Field; the
-    // desktop build reaches the same place and never hits it. The write that first corrupts
-    // the bank has NOT been identified -- this only stops the corruption propagating into a
-    // hang. See wasm-port.md, "The SFX bank hang".
+    // A canary, like the walk bound below: the corruption that made this reachable came from
+    // mm/2s2h/mixer.c and is fixed there.
     if (entryIndex == 0 || entry->prev >= sSfxBankSizes[bankId] ||
         (entry->next != 0xFF && entry->next >= sSfxBankSizes[bankId])) {
         static u8 sReported = 0;
@@ -440,17 +434,15 @@ void AudioSfx_ChooseActiveSfx(u8 bankId) {
     k = 0;
 
     // 2S2H [WASM] A bank's list must be shorter than the bank, so this counts the steps and
-    // gives up rather than walking a cycle. The lists do go circular in the browser build --
-    // gSfxBanks[bankId][0].next ends up pointing at 0, the head sentinel itself -- and this
-    // loop then never terminates. On the desktop it is an ordinary hang; in a browser tab it
-    // takes the whole page down with it, because the frame loop never returns to the event
-    // loop, so nothing renders, no input arrives, and no error is ever reported. The page
-    // simply stops, which is the worst failure mode available.
+    // gives up rather than walking a cycle. Kept as a canary: these lists did go circular --
+    // gSfxBanks[bankId][0].next pointing at 0, the head sentinel itself -- and this loop then
+    // never terminated, which in a browser tab takes the whole page down, because the frame
+    // loop never returns to the event loop and nothing is left to report the failure.
     //
-    // Reproduced by booting to a warp point in Termina Field; the desktop build reaches the
-    // same place and never corrupts a bank. The write that first corrupts it has NOT been
-    // found -- this only keeps the corruption from becoming a hang, at the cost of some sfx
-    // in that bank going quiet. See wasm-port.md, "The SFX bank hang".
+    // The cause was an oversized write through the emulated DMEM window in mm/2s2h/mixer.c
+    // landing on these arrays, which are statics laid out beside the audio globals; it is
+    // fixed there. This stays because the failure it catches is silent and total, and the
+    // check costs one comparison per entry.
     u32 steps = 0;
 
     // Delete stale sfx and prioritize remaining sfx into the gActiveSfx arrays
