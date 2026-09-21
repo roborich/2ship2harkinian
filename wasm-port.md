@@ -560,41 +560,56 @@ If something in that layer blocks boot, disable it **at runtime via CVar default
 reversible, no deletion. The amputations in Milestone 1 are a different axis: they target OS
 services that do not exist in a browser, not UI surface area.
 
-## Effort
+## What is left
 
-Assuming the milestone order above:
+Milestones 0-4 are done (see Status). What remains, in the order I would do it:
 
-| | |
-|---|---|
-| M0 toolchain + baseline | 0.5 day |
-| M1 CMake, amputations, Opus stub | 1–2 days |
-| M1 libultraship rebase (incl. Web Audio) | ≤1 day |
-| M1 **shader re-validation under WebGL2** | **1–3 days — the real unknown** |
-| M2 frame loop, audio, thread shims | 1 day (near-copy) |
-| M3 GUI-only boot | 0.5 day |
-| M4 archives, title, audio tuning | 1–2 days |
-| M4/M5 depth readback | 1–2 days |
-| M5 EmbedderBridge, host.html, docs | 2–3 days |
-| M5 storage enumeration + ModMenu healing | 1–2 days |
-| M5 test suite port | 1–2 days |
-| M5 **measure: MM perf, scene-load hitching, memory ceiling** | 1 day |
-| M6 extractor module | 2–3 days |
+| | | |
+|---|---|---|
+| **Why the DMEM clear was oversized** | 0.5–1 day | `numSamplesToLoadAdj ≈ 10784` on the streamed-codec branch, where a sane value is a few hundred. The window now bounds the damage but the number is still wrong. Eliminate the Opus stub as a suspect first. |
+| **Web Audio player** | 1–2 days | SDL's Emscripten backend runs its callback on the page's main thread, so any long frame is audible whatever the queue depth. The LUS player exists on the SoH side; port it with the `AudioBackend` enum, the `audioBackendsMap` entry (`BenGui/MenuTypes.h:291`) and the fallback guard. |
+| **Storage (M5)** | 1–2 days | Enumerate 2Ship's write paths — `SaveManager` (~30 sites, its own `saves/`), `BinarySaveConverter`, three TimeSplits trackers, `DeveloperTools`, `DeleteFileOnDeath`, `Rando/StartingItems`, `Rando/ExcludedChecks`, `Rando/Spoiler/File`, `PresetManager` — against the bridge's watch list, which currently covers the config and `saves/` only. `NewFileSetup.cpp:126` parses a spoiler file through an unguarded `json::parse`. |
+| **Mods (M5)** | 1 day | `ModMenu.cpp` scans a mods directory; SoH needed a rewrite of its equivalent to tolerate a config listing mods absent from MEMFS. Untested here. |
+| **Depth readback** | 1–2 days | Compiled out under `USE_OPENGLES` because WebGL2 `readPixels` cannot read `GL_DEPTH_STENCIL`, leaving `depth_stencil_value` uninitialized. Consumers: `z_kankyo.c:532` (sun occlusion), `z_lights.c:411` (glow). Needs a depth-to-color path or a CVar. |
+| **Measure** | 1 day | Performance under load, scene-load hitching on the synchronous ResourceManager (Termina Field is the load to measure), and the memory ceiling on Safari/iOS. All still unmeasured. |
+| **Controllers, input polish** | 1 day | Emscripten's SDL2 has a working Gamepad-API backend; untested. |
+| **A `warp` console command** | 1 day | 2Ship has `entrance`/`spawn`/`pos` but nothing with a day-and-time vocabulary, so a host cannot boot straight into a scene the way SoH's can. New work, not a retarget. |
+| **M6: ROM -> o2r converter** | 2–3 days | `2ship-extract.js`, modelled on SoH's `soh/wasm/extract/`. Cheaper here: 2 extraction configs against SoH's 14. |
 
-**2–3 weeks to a playable browser build**, against what was a couple of months of discovery
-on the SoH side. The total is much the same as the first draft's, but the risk sits in
-different places: the LUS rebase and the framebuffer effects both turned out to be small,
-and the shader rewrite, the storage surface and plain unmeasured performance took their
-place.
+Roughly **2 weeks** to a build that is playable, persists what it should, and converts its
+own ROM — with the first two rows being what stands between "renders correctly" and
+"playable".
+
+### Resolved along the way
+
+Things earlier drafts flagged as risks, recorded so they are not re-litigated:
+
+- **The libultraship rebase** — ~1 day, as the review predicted; the alarming upstream line
+  counts were Doxygen. LUS compiled under Emscripten on the first attempt.
+- **The shader rewrite** — upstream replaced `default.shader.{fs,vs}` with a single
+  `default.shader.glsl` between the pins, and an earlier draft called re-validating it under
+  WebGL2 "the real unknown". It needed nothing: `USE_OPENGLES ON` plus
+  `IMGUI_IMPL_OPENGL_ES3` was sufficient and the game rendered correctly on the first boot.
+- **MM's framebuffer effects** — not harder than OoT's; everything goes through
+  `glBlitFramebuffer`, which WebGL2 has, and `ReadFramebufferToCPU` is never reached.
+- **The V8 tier-up crash** that cost the SoH port a session — the Binaryen inlining cap
+  carried over and works; `artifacts.test.ts` and an eager-tier-up run both pass.
+- **The audio handshake** — I diagnosed the crash as the single-threaded integration needing
+  a rewrite. It was a stray write. The integration is fine.
 
 ## Open questions
 
-- Whether LUS's rewritten `default.shader.glsl` compiles under WebGL2 with `USE_OPENGLES`.
-  This is the one part of the 80-commit gap whose cost is not known.
+- Why `AudioSynth_ProcessSample` asked to clear 21,600 bytes of DMEM. The window now bounds
+  it, but the size is still wrong; see "The audio overrun".
 - Whether depth readback needs a depth-to-color path or just a CVar.
 - Whether the synchronous ResourceManager executor is fast enough at scene load, or visibly
-  hitches. Unanswered on the SoH side too — the logging confound was removed but the question
-  was never retested. Termina Field is the load to measure.
-- Memory ceiling. wasm32 caps at 4 GB and `-sMAXIMUM_MEMORY=4GB` works in current desktop
-  browsers, but Safari and iOS are tighter. Measure this tree's desktop RSS before committing.
-- Performance. MM is a heavier game than OoT; entirely untested here.
+  hitches. Unanswered on the SoH side too. Termina Field is the load to measure.
+- Memory ceiling. The build sits at its 512 MB initial size with no growth over a few
+  minutes, but wasm32 caps at 4 GB and Safari and iOS are tighter than desktop Chrome. No
+  mobile browser has been tried.
+- Performance under load. MM is a heavier game than OoT and nothing here is a benchmark: the
+  measurements so far only establish that the loop keeps its rate, not that it has headroom.
 - Is `-fwasm-exceptions` acceptable for the target browsers?
+
+Answered since the first draft: the shader rewrite (no work needed), MM's framebuffer effects
+(no work needed), and the libultraship rebase (~1 day). See "Resolved along the way".

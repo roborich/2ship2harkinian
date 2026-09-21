@@ -32,7 +32,6 @@ one from another build, which the boot tests rely on.
 |---|---|
 | `SHIP_WASM_SLOW=1` | run the timing tests, which sample the game for tens of seconds |
 | `SHIP_WASM_SOAK=1` | run the ten-minute memory soak |
-| `SHIP_WASM_KNOWN_BUGS=1` | run `known-bugs.test.ts`, to confirm those defects still reproduce |
 | `SHIP_WASM_HEADED=1` | show the browser |
 | `SHIP_WASM_BUDGET_MIN` | wall-clock budget for `bun run test` (default 30) |
 
@@ -52,8 +51,10 @@ one from another build, which the boot tests rely on.
   tick.
 - `smoke-tiering.test.ts` — runs with V8 compiling every function up front, which is how the
   sibling port's renderer crash reproduced in seconds instead of minutes.
+- `regression.test.ts` — the audio overrun that corrupted the audio globals: three minutes of
+  play, and a warp-point boot into Termina Field, which used to die in ten seconds. Slow by
+  design; these are the tests that would notice it coming back.
 - `soak.test.ts` (opt-in) — ten minutes without heap growth.
-- `known-bugs.test.ts` (opt-in) — defects that are known and unfixed; see wasm-port.md.
 
 ## Playing a build
 
