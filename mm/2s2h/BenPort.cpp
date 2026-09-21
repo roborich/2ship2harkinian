@@ -1453,6 +1453,14 @@ float divisor_num = 0.0f;
 
 // Batch a coordinate to have its depth read later by OTRGetPixelDepth
 extern "C" void OTRGetPixelDepthPrepare(float x, float y) {
+    // 2S2H [WASM] GLES has no glReadPixels(GL_DEPTH_STENCIL), so the OpenGL backend's
+    // GetPixelDepth compiles out its only read (both calls sit behind #ifndef USE_OPENGLES, and
+    // this build sets USE_OPENGLES). Batching a coordinate here would still make it blit the
+    // depth buffer once per coordinate per frame for a value nobody can read back, so stop
+    // before anything is queued rather than inside the renderer.
+#ifdef __EMSCRIPTEN__
+    return;
+#else
     // Invert the Y value to match the origin values used in the renderer
     float adjustedY = SCREEN_HEIGHT - y;
 
@@ -1462,9 +1470,28 @@ extern "C" void OTRGetPixelDepthPrepare(float x, float y) {
     }
 
     wnd->GetPixelDepthPrepare(x, adjustedY);
+#endif
 }
 
 extern "C" uint16_t OTRGetPixelDepth(float x, float y) {
+    // 2S2H [WASM] No depth readback here (see OTRGetPixelDepthPrepare), so answer with the
+    // game's own "no depth information" sentinel -- z_kankyo.c:70 initialises sSunScreenDepth to
+    // exactly this value. All four consumers then read it as "nothing occludes": the sun's lens
+    // flare (z_kankyo.c), the point-light glows (z_lights.c), and the two Invadepoh UFO flare
+    // checks (z_en_invadepoh.c, z_en_invadepoh_demo.c). Shifted through SysCfb_GetZBufferInt it
+    // exceeds any wZ a glow inside the frustum can produce, so those draw too.
+    //
+    // This is a behaviour change, not just a saving. The GLES path left the batched readback
+    // zero-filled -- std::vector<uint32_t>(n) in gfx_opengl.cpp, not uninitialised -- which reads
+    // as "fully occluded", so the flare and the glows never drew here at all. They draw now, and
+    // because there is no depth information they also draw through geometry that should hide
+    // them. That is the deliberate trade until a depth-to-colour path exists: a handful of XLU
+    // quads per frame, against a depth blit per coordinate plus its framebuffer binds. The
+    // uninitialised read was real, but only on the single-coordinate branch -- which is the one
+    // the Invadepoh checks take every frame, since neither of them calls Prepare first.
+#ifdef __EMSCRIPTEN__
+    return GPACK_ZDZ(G_MAXFBZ, 0);
+#else
     // Invert the Y value to match the origin values used in the renderer
     float adjustedY = SCREEN_HEIGHT - y;
 
@@ -1474,6 +1501,7 @@ extern "C" uint16_t OTRGetPixelDepth(float x, float y) {
     }
 
     return wnd->GetPixelDepth(x, adjustedY);
+#endif
 }
 
 extern "C" bool ResourceMgr_IsAltAssetsEnabled() {

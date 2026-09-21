@@ -417,7 +417,11 @@ its source directory absent from the tree. That is three of SoH's shims gone.
      the earlier revision holds.
 
    What is left is depth readback, compiled out under `USE_OPENGLES` because WebGL2
-   `readPixels` cannot read `GL_DEPTH_STENCIL`, leaving `depth_stencil_value` uninitialized.
+   `readPixels` cannot read `GL_DEPTH_STENCIL`. *(Corrected 2026-09-21: "leaving
+   `depth_stencil_value` uninitialized" was only half of it. The single-coordinate branch does
+   read an uninitialised local, but the batched branch fills a zero-initialised
+   `std::vector<uint32_t>`, which reads as **fully occluded** — so the sun flare and the point
+   glows were not flickering, they were never drawing at all.)*
    Its consumers are exactly OoT's two: `mm/src/code/z_kankyo.c:532` (sun occlusion) and
    `mm/src/code/z_lights.c:411` (glow check), both reached through
    `OTRGetPixelDepthPrepare` / `OTRGetPixelDepth` (`mm/2s2h/BenPort.cpp:1277-1299`).
@@ -810,7 +814,7 @@ masked by a test that passes:
 |---|---|---|
 | **Audio backend availability guard + menu filter** | ~15 lines | Port LUS `30d0cf54` and SoH's `f3d5e096c`. A config naming `coreaudio` silences the build through `NullAudioPlayer` with no diagnostic. Do this first: otherwise it is a false lead the moment anyone touches audio. Add `audioDrains(...)` to `mm/wasm/tests/smoke.test.ts:26`, which covers this case today and never listens. |
 | **Force `GetInterpolationFPS()` to 20 under Emscripten** | ~1 hour | `mm/2s2h/BenPort.cpp:861-870`. Closes the `is_recording` path for a host-supplied desktop config, not just the UI — better than SoH's UI-only guard — and lets `:1365` drop its `#ifdef`. Guard the three widgets at `mm/2s2h/BenGui/BenMenu.cpp:623-652` too, so they are not inoperative controls. |
-| **Early-return `OTRGetPixelDepth*` under Emscripten** | ~1 hour | `mm/2s2h/BenPort.cpp:1443-1464`. Removes one `glBlitFramebuffer` per glow coordinate per frame that nothing reads, and the uninitialised `depth_stencil_value` read, in one place without touching LUS. Sun/glow occlusion becomes consistently on or off instead of flickering off garbage — an improvement on today. |
+| ~~**Early-return `OTRGetPixelDepth*` under Emscripten**~~ | done | Landed. Removes a `glBlitFramebuffer` per coordinate per frame that nothing reads, the uninitialised single-coordinate read, and a `glDisable(GL_SCISSOR_TEST)` that `gfx_opengl.cpp` never re-enabled. Returns the game's own no-depth sentinel, so the sun flare, the point glows and the two Invadepoh UFO flares now draw — they previously never drew, because the batched readback was zero-filled. **Needs an eyeball**: they also draw through geometry that should hide them. |
 | **Fix the vacuous timing test** | minutes | `mm/wasm/tests/timing.test.ts:32` → `config.CVars.gInterpolationFPS = 60`. Until then the one-draw-per-tick guarantee is untested. |
 | **Web Audio player** | 1–2 days | See Milestone 4b for the full plan. Also the cheapest mitigation for the pause-screen readback stall, which becomes survivable rather than audible. |
 | **Why the DMEM clear was oversized** | 0.5–1 day | `numSamplesToLoadAdj ≈ 10784` where the arithmetic caps a healthy value near 400. Narrowed: it cannot come from tuning, so the note's `Sample` was already corrupt — the clear is a symptom. Instrument `synthesis.c:1151` and run it on desktop as well as wasm; see "The audio overrun". |
@@ -818,7 +822,7 @@ masked by a test that passes:
 | **`-fsanitize=function` sweep** | 0.5 day | Two signature mismatches were found, but both by wasm-ld — which only sees *direct* calls. Mismatches through function-pointer slots trap at runtime, and M5 exercises far more of the tree. Enumerate them on a native build before chasing one in a browser. |
 | **Storage (M5)** | 1–2 days | Enumerate 2Ship's write paths — `SaveManager` (~30 sites, its own `saves/`), `BinarySaveConverter`, three TimeSplits trackers, `DeveloperTools`, `DeleteFileOnDeath`, `Rando/StartingItems`, `Rando/ExcludedChecks`, `Rando/Spoiler/File`, `PresetManager` — against the bridge's watch list, which currently covers the config and `saves/` only. `NewFileSetup.cpp:126` parses a spoiler file through an unguarded `json::parse`. |
 | **Mods (M5)** | 1 day | `ModMenu.cpp` scans a mods directory; SoH needed a rewrite of its equivalent to tolerate a config listing mods absent from MEMFS. Untested here. |
-| **Depth readback** | 1–2 days | Compiled out under `USE_OPENGLES` because WebGL2 `readPixels` cannot read `GL_DEPTH_STENCIL`, leaving `depth_stencil_value` uninitialized. Consumers: `z_kankyo.c:532` (sun occlusion), `z_lights.c:411` (glow). Needs a depth-to-color path or a CVar. |
+| **Depth readback** | 1–2 days | Compiled out under `USE_OPENGLES` because WebGL2 `readPixels` cannot read `GL_DEPTH_STENCIL`. Four consumers: `z_kankyo.c:532` (sun), `z_lights.c:411` (glow), and `z_en_invadepoh.c:1301` / `z_en_invadepoh_demo.c:581` (UFO flares), the last two reaching the single-coordinate branch every frame because neither calls Prepare. Occlusion is now permanently off (see above), so these effects draw through walls. Needs a depth-to-color path or a CVar to suppress them. |
 | **Measure** | 1 day | Performance under load, scene-load hitching on the synchronous ResourceManager (Termina Field is the load to measure), and the memory ceiling on Safari/iOS. All still unmeasured. |
 | **Controllers, input polish** | 1 day | Emscripten's SDL2 has a working Gamepad-API backend; untested. |
 | **A `warp` console command** | 1 day | 2Ship has `entrance`/`spawn`/`pos` but nothing with a day-and-time vocabulary, so a host cannot boot straight into a scene the way SoH's can. New work, not a retarget. |
