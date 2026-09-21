@@ -11,6 +11,72 @@ findings, traps and measurements from that work are written up in that repo's
 discovery is already paid for. This document records what carries over, what does not, and
 what is genuinely new here.
 
+## Status (2026-09-21)
+
+**Milestones 0-4 are done.** The game boots in a browser, renders Termina/Clock Town
+correctly, runs at the right speed, plays audio and responds to the console. Milestone 3 (a
+GUI-only boot) was skipped: the full game rendered on the first attempt, so there was nothing
+to isolate.
+
+| | |
+|---|---|
+| `2ship.wasm` | 23.6 MB raw · 6.5 MB gzip · **3.5 MB brotli** |
+| `2ship.js` / `2ship.data` | 0.4 MB / 1.8 MB |
+| Tick rate | 60/`R_UPDATE_RATE` Hz, within 5%, one frame drawn per tick |
+| Heap | 512 MB at the initial size, no growth observed over ~2 minutes |
+| Tests | 35, passing (`mm/wasm/tests`) |
+
+3.5 MB over the wire is an ordinary web download, so **size is not a constraint** and no
+splitting or streaming strategy is needed — the same conclusion the SoH port reached.
+
+Build it with:
+
+```
+cmake --build build-cmake --target Generate2ShipOtr     # 2ship.o2r, from a desktop build
+emcmake cmake -H. -Bbuild-wasm -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+  -DSHIP_WASM_ASSET_DIR=$PWD/build-cmake/mm
+cmake --build build-wasm -j10
+```
+
+`mm.o2r` is not built in and not built here: produce it from a ROM with a desktop build and
+hand it to the page (`mm/wasm/HOST-API.md`).
+
+### What is broken
+
+Two defects, both in audio, both recorded as skipped tests in
+`mm/wasm/tests/known-bugs.test.ts`.
+
+**The audio crash.** One or two minutes into any session the audio update trips a
+`RuntimeError: memory access out of bounds` inside `osRecvMesg`, called from
+`AudioMgr_CreateNextAudioBuffer` (`mm/src/audio/lib/thread.c:24`) draining
+`gAudioCtx.threadCmdProcQueueP`. Emscripten's handler then stops the main loop, so the canvas
+freezes with no error on the page. LUS's `osRecvMesg` reads `*(mq->msg + mq->first)` with no
+bounds check, so a queue whose `validCount` is non-zero but whose storage is stale reads out
+of the heap.
+
+That queue is filled by `Audio_Update` on what used to be the game thread and drained by
+`AudioMgr_CreateNextAudioBuffer` on what used to be the audio thread, and this build runs both
+on one thread in a fixed order inside a frame. The audio-heap reset handshake
+(`gAudioCtx.resetStatus`, `AudioHeap_ResetStep`, `AudioSeq_UpdateAudioHeapReset`) is written
+for two threads and polls across frames. **This is the "rewrite the audio handshake, don't
+just move the thread" hazard, and it is the next thing to fix.** Ruled out along the way:
+`R_UPDATE_RATE` overrunning the update buffer (instrumented; never fires), and the V8 tier-up
+crash (the artifacts test and an eager-tier-up run both pass).
+
+**The SFX bank cycle.** Booting to a saved warp point in Termina Field corrupts an SFX bank's
+linked list: `gSfxBanks[bank][0].next` comes to point at `0`, the list's own head sentinel, and
+`AudioSfx_ChooseActiveSfx` walks the cycle forever. The walk is now counted and abandoned
+(`mm/src/audio/sfx.c`), so it no longer wedges the tab, but the first corrupting write is
+unidentified. The desktop build, run against the same archives and the same warp point through
+`SHIP_HOME`, never corrupts a bank — so this is not simply a latent 2Ship bug that wasm
+happens to expose.
+
+### Not started
+
+Milestone 5 (storage, mods, keyboard polish), Milestone 6 (the ROM converter), the Web Audio
+player, and depth readback. The build plays through SDL's Emscripten audio backend, whose
+callback runs on the page's main thread, so any long frame is audible.
+
 ## Scope for the first pass
 
 Same narrow scope that made the SoH port a port and not a rewrite:
@@ -312,7 +378,7 @@ Do not re-discover these. From the SoH branch:
 Milestones mirror SoH's, which were chosen so each one has a single possible cause of
 failure. Do not reorder them.
 
-### Milestone 0 — toolchain and baseline
+### Milestone 0 — toolchain and baseline ✅ DONE
 
 - `git submodule update --init --recursive` (all three submodules are currently unchecked-out
   in this tree).
@@ -322,7 +388,18 @@ failure. Do not reorder them.
   a host ZAPD and handed to the wasm build.
 - Confirm the desktop build is green before changing anything.
 
-### Milestone 1 — compiles and links
+### Milestone 1 — compiles and links ✅ DONE
+
+**Outcome.** libultraship compiled under Emscripten on the first attempt, and the decomp
+needed no source change to translate to wasm — everything below was build plumbing, as on the
+SoH side. Two source bugs did surface at the link, both real and neither Emscripten's doing:
+`framebuffer_effects.c` declared `gfx_create_framebuffer` with five parameters where
+`interpreter.h` declares six (the last a C++ default argument a C prototype cannot express),
+and `graph.c` called `PadMgr_ThreadEntry` with an argument it does not take. Native builds
+tolerate both; wasm has typed calls, and wasm-ld had replaced every `gfx_create_framebuffer`
+call with a stub that traps — which would have taken down the first frame using a framebuffer
+effect. `--use-port=libpng` was needed beyond the plan's list, for `ColorPictograph`.
+
 
 - Fork libultraship from `7f9b86a5`; port the wasm patch (see "Needs real work" §1). Land
   the non-audio parts first — `USE_OPENGLES`, the GL context request, the synchronous
@@ -348,7 +425,7 @@ failure. Do not reorder them.
 SoH's decomp translated to wasm without a single source change, and everything else was
 build plumbing.
 
-### Milestone 2 — single-threaded shims
+### Milestone 2 — single-threaded shims ✅ DONE
 
 - Compile out the body of `OTRGlobals::RunExtract` (`mm/2s2h/BenPort.cpp:275`). Beyond the
   ZAPD dependency, its `while (!extractDone)` frame-pump would hang the tab outright: it
@@ -364,7 +441,11 @@ build plumbing.
 - `emscripten_set_main_loop` + the tick clock in `graph.c`.
 - Preload `gamecontrollerdb.txt` (a missing file only logs, but the log is noise).
 
-### Milestone 3 — boots to an ImGui frame
+### Milestone 3 — boots to an ImGui frame — SKIPPED
+
+Not needed: the full game rendered correctly on the first attempt, so there was never a
+failure with three possible causes to isolate. Kept below in case a render problem later
+needs the game taken out of the picture.
 
 Before touching the game, stand up SDL + WebGL2 + ImGui alone via
 `Fast3dWindow::RunGuiOnly()`. This isolates the window/render/GUI stack from both the game
@@ -376,7 +457,7 @@ Force `ImGuiConfigFlags_ViewportsEnable` off: it needs real OS windows.
 
 Delete this path once Milestone 4 lands; it will rot otherwise.
 
-### Milestone 4 — boots to title, with sound
+### Milestone 4 — boots to title, with sound ✅ DONE
 
 - Pre-mount `2ship.o2r` (via `--preload-file`, `SHELL:`-wrapped) and accept `mm.o2r` from the
   host.
