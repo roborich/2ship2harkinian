@@ -24,7 +24,7 @@ to isolate.
 | `2ship.js` / `2ship.data` | 0.4 MB / 1.8 MB |
 | Tick rate | 60/`R_UPDATE_RATE` Hz, within 5%, one frame drawn per tick |
 | Heap | 512 MB at the initial size, no growth observed over ~2 minutes |
-| Tests | 35, passing (`mm/wasm/tests`) |
+| Tests | 37, passing (`mm/wasm/tests`) |
 
 3.5 MB over the wire is an ordinary web download, so **size is not a constraint** and no
 splitting or streaming strategy is needed — the same conclusion the SoH port reached.
@@ -41,35 +41,76 @@ cmake --build build-wasm -j10
 `mm.o2r` is not built in and not built here: produce it from a ROM with a desktop build and
 hand it to the page (`mm/wasm/HOST-API.md`).
 
-### What is broken
+### The audio overrun — fixed 2026-09-21
 
-Two defects, both in audio, both recorded as skipped tests in
-`mm/wasm/tests/known-bugs.test.ts`.
+For about a day this looked like two defects: a hang (an sfx bank's linked list turning
+circular) and a crash a minute or two into any session (an out-of-bounds read inside
+`osRecvMesg`, draining an audio queue). I wrote the second one up as the single-threaded
+audio handshake needing a rewrite. **That was wrong**, and it was wrong because I read the
+`osRecvMesg` stack without asking what had corrupted the queue in the first place.
 
-**The audio crash.** One or two minutes into any session the audio update trips a
-`RuntimeError: memory access out of bounds` inside `osRecvMesg`, called from
-`AudioMgr_CreateNextAudioBuffer` (`mm/src/audio/lib/thread.c:24`) draining
-`gAudioCtx.threadCmdProcQueueP`. Emscripten's handler then stops the main loop, so the canvas
-freezes with no error on the page. LUS's `osRecvMesg` reads `*(mq->msg + mq->first)` with no
-bounds check, so a queue whose `validCount` is non-zero but whose storage is stale reads out
-of the heap.
+AddressSanitizer answered it in one run: `global-buffer-overflow`, **WRITE of size 21600**,
+in `aClearBufferImpl`, from the `CODEC_S16` / `CODEC_OPUS` branch of
+`AudioSynth_ProcessSample` (`mm/src/audio/lib/synthesis.c`, the
+`(numSamplesToLoadAdj + SAMPLES_PER_FRAME) * SAMPLE_SIZE` clear).
 
-That queue is filled by `Audio_Update` on what used to be the game thread and drained by
-`AudioMgr_CreateNextAudioBuffer` on what used to be the audio thread, and this build runs both
-on one thread in a fixed order inside a frame. The audio-heap reset handshake
-(`gAudioCtx.resetStatus`, `AudioHeap_ResetStep`, `AudioSeq_UpdateAudioHeapReset`) is written
-for two threads and polls across frames. **This is the "rewrite the audio handshake, don't
-just move the thread" hazard, and it is the next thing to fix.** Ruled out along the way:
-`R_UPDATE_RATE` overrunning the update buffer (instrumented; never fires), and the V8 tier-up
-crash (the artifacts test and an eager-tier-up run both pass).
+`rspa.buf` in `mm/2s2h/mixer.c` emulates the RSP's DMEM window. It was `0xC80` bytes biased
+by `-0x0330` — exactly the `0x0330..0x0FB0` range the ucode's DMEM map uses, and correct
+right up until a command asks for more than fits. `DMEM_UNCOMPRESSED_NOTE` leaves 2,624 bytes
+above it, so that one command wrote about **19 KB past the end of a static struct**, into
+whatever the linker had placed next: the audio globals, `gAudioCtx`, and the sfx banks' static
+entry arrays. Both symptoms were that one write, seen from two directions.
 
-**The SFX bank cycle.** Booting to a saved warp point in Termina Field corrupts an SFX bank's
-linked list: `gSfxBanks[bank][0].next` comes to point at `0`, the list's own head sentinel, and
-`AudioSfx_ChooseActiveSfx` walks the cycle forever. The walk is now counted and abandoned
-(`mm/src/audio/sfx.c`), so it no longer wedges the tab, but the first corrupting write is
-unidentified. The desktop build, run against the same archives and the same warp point through
-`SHIP_HOME`, never corrupts a bank — so this is not simply a latent 2Ship bug that wasm
-happens to expose.
+On hardware the RSP cannot reach outside DMEM at all, so the fix is to make the emulated
+window behave the same way. Rather than bounds-check all 28 `aXxxImpl` shims, it now covers
+every address a 16-bit DMEM address can name plus the largest transfer a command can request:
+a `uint16_t` address plus a `uint16_t` count cannot reach outside `0x20000`, so unsigned
+counts are safe by construction and only the two signed ones need a clamp. Legitimate traffic
+is unaffected — the map lands at the same offsets in the same order — and the extra 128 KB is
+static.
+
+| | before | after |
+|---|---|---|
+| Warp-point boot (Termina Field) | dead in ~10 s | clean |
+| Normal boot | dead in 1–2 min | 150 s clean, 4 scene transitions |
+| Measured tick rate | 5.10 Hz (the loop had stopped) | **19.74 Hz** against 20 |
+| Audio drops | — | 0 |
+
+**Still open: why the clear was oversized.** 21,600 bytes is `numSamplesToLoadAdj ≈ 10784`
+where a sane value is a few hundred, on the branch that handles the port's own streamed-audio
+codecs. The window now bounds the damage, but that number is still wrong, and the Opus stub
+(§"Ports nearly verbatim") is a suspect worth eliminating first.
+
+Two guards remain in `mm/src/audio/sfx.c` as canaries — a bound on the bank walk and a refusal
+to unlink the list sentinel. The failure they catch is silent and total, and they cost one
+comparison per entry.
+
+### Also fixed: a use-after-free in the config migration
+
+From the same ASan run. `Ben::ConfigVersion1Updater::Update` bound `const auto&` to a
+subobject of the temporary that `Ship::Config::GetNestedJson()` returns **by value**; lifetime
+extension does not reach through a member call, so the temporary died at the end of the
+statement and every read through the reference was a use-after-free. Desktop finds the freed
+bytes intact and carries on. This one is not wasm-specific — it is a latent bug in 2Ship that
+the browser build's allocator simply refuses to forgive.
+
+### The tool that found both
+
+`-fsanitize=address` works on this module, and was worth the 10-minute link:
+
+```
+emcmake cmake -H. -Bbuild-wasm-asan -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DSHIP_WASM_ASSET_DIR=$PWD/build-cmake/mm \
+  -DCMAKE_C_FLAGS=-fsanitize=address -DCMAKE_CXX_FLAGS=-fsanitize=address \
+  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address -sINITIAL_MEMORY=1073741824 -sALLOW_MEMORY_GROWTH=1 -sSTACK_SIZE=8388608"
+```
+
+The resulting module is ~380 MB and takes about 40 s to instantiate, so the test harness's
+10-second call timeout has to be avoided — poll the console instead of calling into the page.
+`__asan_default_options` in `EmbedderBridge.cpp` sets `halt_on_error=0`, which is what makes
+one run report the whole list rather than one item per relink; it also turns off
+`detect_container_overflow`, which the FetchContent dependencies trip as a known false
+positive. Reach for this before theorising about a memory fault again.
 
 ### Not started
 
