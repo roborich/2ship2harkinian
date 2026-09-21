@@ -74,7 +74,11 @@ MM changes the divisor in **more** places than OoT does:
 |---|---|---|
 | 3 | 20 Hz | gameplay (`game.c:235`), `z_play.c:784,831,865,894,930,953`, kaleido NES ×5 |
 | 2 | 30 Hz | pause setup (`z_kaleido_setup.c:138`), message (`z_message.c:5993`) |
-| 1 | 60 Hz | title (`z_title.c:245`), select (`z_select.c:1133`), opening (`z_opening.c:59`), file choose (`z_file_choose_NES.c:2617`), `z_play.c:1001` |
+| 1 | 60 Hz | title (`z_title.c:245`), select (`z_select.c:1133`), opening (`z_opening.c:59`), file choose (`z_file_choose_NES.c:2617`), **day transition (`z_daytelop.c:243`)**, pre-NMI (`z_prenmi.c:53`), `z_play.c:1001` |
+
+`z_daytelop.c` is the one that matters for testing: the "Dawn of the Nth Day" screen is
+entered mid-gameplay every in-game day, so a timing or audio test that assumes 20 Hz
+throughout a play session will see a 60 Hz stretch it did not expect.
 
 A loop pinned to one rate breaks the cancellation and audio comes out at
 `rate * R_UPDATE_RATE * ~533` samples/sec — wrong speed in every state but the one it was
@@ -139,25 +143,24 @@ its source directory absent from the tree. That is three of SoH's shims gone.
 
 ### Needs real work
 
-1. **The libultraship rebase — the biggest unknown.**
-   This tree pins LUS `7f9b86a5` (2026-08-30). The SoH wasm patch is based on `fdcaf633`
-   (2026-03-25), **80 commits behind**, and upstream rewrote precisely what the patch
-   touches:
+1. **The libultraship rebase — smaller than the line counts suggest.**
+   *(Revised 2026-09-21 after review, and after the port was actually done.)* An earlier
+   draft called this the biggest unknown, on the strength of upstream churn in the files the
+   patch touches. That churn is mostly Doxygen: `AudioPlayer.h`'s "+114" is comments, and the
+   only semantic change to the audio interface between the pins is `~AudioPlayer()` becoming
+   `virtual`. `WebAudioAudioPlayer` implements `DoInit`/`DoClose`/`DoPlay`/`Buffered`, none
+   of which changed.
 
-   | File | Upstream churn between the pins |
-   |---|---|
-   | `include/ship/audio/AudioPlayer.h` | +114 |
-   | `include/ship/audio/Audio.h` | +66 |
-   | `include/ship/audio/SoundMatrixDecoder.h` | +73 (new surround path) |
-   | `src/ship/Context.cpp` | +225 |
-   | `src/ship/config/Config.cpp` | +147 |
-   | `src/fast/backends/gfx_opengl.cpp` | +97 |
-   | `src/fast/backends/gfx_sdl2.cpp` | +86 |
+   A 3-way dry run (`git merge-tree fdcaf633 <lus-wasm-tip> 7f9b86a5`) produces **four
+   conflict hunks, all trivial**: the `WEBAUDIO` enum member, `HasFailed()`, and the fact
+   that upstream deleted `Config::GetCurrentAudioBackend` and moved backend resolution into
+   `Audio::GetSavedAudioBackend()` — so the Config.cpp half of the patch lands in Audio.cpp
+   instead. `ResourceManager.{h,cpp}`, `Context.cpp`, `gfx_opengl.cpp`, `gfx_sdl2.cpp` and
+   both CMakeLists merge clean.
 
-   The wasm patch itself is small — 569 lines across 14 files — but `WebAudioAudioPlayer`
-   (61 lines C++ + a 291-line AudioWorklet) implements the old `AudioPlayer` interface.
-   Expect to reimplement rather than cherry-pick. Upstream LUS has **no** Emscripten support
-   at all, so there is nothing to build on and nothing to conflict with conceptually.
+   Confirmed in practice: the non-audio half landed as 99 lines across 6 files and
+   libultraship compiled clean under Emscripten on the first attempt. Budget **≤1 day**
+   including Web Audio.
 
    This work benefits both ports — SoH and 2Ship consume the same LUS — so do it once, on a
    fork branched from `7f9b86a5`, and point both trees at it.
@@ -174,31 +177,90 @@ its source directory absent from the tree. That is three of SoH's shims gone.
    and a `warp` console command that resolves age and time of day. MM needs its own vocabulary
    — day of the three-day cycle, not age.
 
-4. **Framebuffer effects — the one place MM is harder than OoT.**
-   `mm/2s2h/framebuffer_effects.c` leans on `gfx_create_framebuffer` / framebuffer copies far
-   more than OoT does (pause blur, motion blur, the reusable and N64-res buffers at `:19-31`).
-   Two known WebGL2 gaps in LUS are still open and MM will hit them harder:
-   - `ReadFramebufferToCPU` uses `GL_UNSIGNED_SHORT_5_5_5_1`; WebGL2 `readPixels` permits
-     only RGBA/UNSIGNED_BYTE.
-   - Depth readback is compiled out under `USE_OPENGLES`, leaving `depth_stencil_value`
-     uninitialized. Consumers here: `mm/src/code/z_kankyo.c:532` (sun occlusion) and
-     `mm/src/code/z_lights.c:411`, both reached through `OTRGetPixelDepthPrepare` /
-     `OTRGetPixelDepth` (`mm/2s2h/BenPort.cpp:1277-1299`).
+4. **Depth readback — the only real WebGL2 gap.**
+   *(Revised 2026-09-21 after review.)* An earlier draft claimed MM's framebuffer effects
+   would hit two WebGL2 gaps harder than OoT. Checked, and that is wrong on both counts:
 
-   SoH deferred both. Here they should be budgeted as real work: a depth-to-color path, or a
-   CVar that disables the effects.
+   - `ReadFramebufferToCPU`'s `GL_UNSIGNED_SHORT_5_5_5_1` readback **is already fixed
+     upstream** at `7f9b86a5` (it reads RGBA/UNSIGNED_BYTE and converts on the CPU) — and
+     2Ship never issues it anyway: there is no `gsSPReadFB` / `G_READFB` anywhere in
+     `mm/src` or `mm/2s2h`.
+   - Every MM framebuffer effect (`FB_CopyToFramebuffer` / `FB_DrawFromFramebuffer` in
+     `z_play.c` and `z_visfbuf.c`, and all of `framebuffer_effects.c`) goes through
+     `OTR_G_COPYFB` → `CopyFramebuffer` → `glBlitFramebuffer`, which WebGL2 has. Nothing
+     here is MM-specific or harder than OoT.
 
-5. **Exception handling.** 28 `throw` sites and 15 `std::stoi` call sites under `mm/2s2h`.
+   What is left is depth readback, compiled out under `USE_OPENGLES` because WebGL2
+   `readPixels` cannot read `GL_DEPTH_STENCIL`, leaving `depth_stencil_value` uninitialized.
+   Its consumers are exactly OoT's two: `mm/src/code/z_kankyo.c:532` (sun occlusion) and
+   `mm/src/code/z_lights.c:411` (glow check), both reached through
+   `OTRGetPixelDepthPrepare` / `OTRGetPixelDepth` (`mm/2s2h/BenPort.cpp:1277-1299`).
+   Budget **1–2 days** for a depth-to-color path or a CVar that disables it.
+
+5. **What the 80-commit LUS gap actually brings.** Not the audio interface (above), but:
+   - **The shaders were rewritten.** Upstream deleted
+     `src/fast/shaders/opengl/default.shader.{fs,vs}` and replaced them with a single
+     `default.shader.glsl`. SoH's finding that `USE_OPENGLES ON` fixes shader compilation was
+     validated against the *old* files. This must be re-validated under WebGL2, and it is now
+     the one part of the gap with genuinely unknown cost.
+   - `monocypher` is FetchContent'd unconditionally and linked `PUBLIC` — a new network fetch
+     that `emscripten-deps.cmake` does not account for. Pure C; should build.
+   - `find_package(Python3 REQUIRED COMPONENTS Interpreter)` is now needed at LUS configure
+     time (it generates `DefaultKeys.h`). Host-side, but M0 must list it.
+   - `ENABLE_SCRIPTING` is new, pulls in libtcc, and `LibraryLoader.cpp` `#error`s on any
+     target that is not Windows/Linux/Apple. Default OFF and this tree never sets it —
+     **record that it must stay OFF for Emscripten.**
+
+6. **Storage is a bigger surface here than in SoH.** SoH's `file-saved` watch covered one
+   config file and `/Save/`. 2Ship writes to disk from `SaveManager/SaveManager.cpp` (~30
+   sites, its own `saves/` directory), `BinarySaveConverter.cpp`, three TimeSplits trackers,
+   `DeveloperTools.cpp`, `DeleteFileOnDeath.cpp`, `Rando/StartingItems.cpp`,
+   `Rando/ExcludedChecks.cpp`, `Rando/Spoiler/File.cpp` and `PresetManager.cpp`. It also
+   *reads* a spoiler file at `Saving/NewFileSetup.cpp:126` through an unguarded
+   `json::parse`. Enumerate these in M5 rather than assuming SoH's two paths.
+
+   `Enhancements/ModMenu/ModMenu.cpp` scans a mods directory; SoH needed a ~120-line rewrite
+   of its equivalent to tolerate a config listing mods that are absent from MEMFS. Add it to
+   the carry-over list.
+
+7. **Exception handling.** 29 `throw` sites and 18 `std::sto*` call sites under `mm/2s2h`.
    Emscripten disables exception catching by default and any `throw` aborts; budget
    `-fwasm-exceptions`, tree-wide, with `-sWASM_LEGACY_EXCEPTIONS=1` named explicitly so every
    object and every Emscripten port agrees on the ABI.
 
+   Separately: an exception escaping the frame callback reaches Emscripten's
+   `handleException`, which stops the main loop — the tab stays alive, the game freezes, and
+   the console shows only "Uncaught Exception {stack: undefined}" with no message. SoH added a
+   `RunFrameGuarded` wrapper to name it. Carry that over.
+
+8. **A `warp` console command does not exist here.** 2Ship's console
+   (`mm/2s2h/DeveloperTools/DebugConsole.cpp`) has `entrance`, `spawn`, `pos`, `file_select`,
+   `reset`, `void`, `reload`, `give_item`, `quit` — nothing with a day/time vocabulary. SoH's
+   `warp` is new work here, not a retarget.
+
+9. **`audioBackendsMap` needs a `WEBAUDIO` entry.** `mm/2s2h/BenGui/MenuTypes.h:291-296`
+   lists WASAPI/CoreAudio/SDL/Null. 2Ship's map combobox heals an unknown key to
+   `comboMap->begin()->first`, which on an `unordered_map` is arbitrary — so merely opening
+   Settings could silently switch the backend. Must land with the Web Audio player.
+
 ### Traps that do *not* apply here
 
-- **No `fault.c`.** SoH's `Fault_AddHungupAndCrashImpl` crashes deliberately via
-  `*(u32*)0x11111111 = 0`, which in linear memory is a *valid* address ~286 MB in — no trap,
-  execution continues with corrupted state. This tree has no `fault.c`.
-- **No networking amputation.** See §4 above.
+- **No networking amputation.** See §4 above. CrowdControl is already behind
+  `ENABLE_CROWD_CONTROL` and its source directory is absent from the tree.
+- **No `ReadFramebufferToCPU`.** See above.
+
+### A trap that arrives differently — the fault path
+
+*(Corrected 2026-09-21: an earlier draft said this tree has no `fault.c`. It does —
+`mm/src/boot/fault.c`, and it is compiled.)* `Fault_AddHungupAndCrashImpl`
+(`mm/src/boot/fault.c:1171`) is `assert(0)`, with the decomp's
+`*(u32*)0x11111111 = 0` commented out below it. Under a Release build `NDEBUG` compiles the
+assert away, so the function **returns** and all 24 `Fault_AddHungupAndCrash` call sites
+carry on with the corrupted state that brought them there — the same silent-continue trap
+SoH had, reached by a different route. (The commented-out store would not have helped
+either: in linear memory `0x11111111` is a valid address ~286 MB in and would not trap.)
+Fixed with `abort()` under `__EMSCRIPTEN__`, which traps in wasm and gives the page a stack
+trace.
 
 ### Traps that do apply, already diagnosed
 
@@ -255,6 +317,7 @@ failure. Do not reorder them.
 - `git submodule update --init --recursive` (all three submodules are currently unchecked-out
   in this tree).
 - emsdk 6.0.9 (`~/emsdk`), the version the SoH build used.
+- Python 3 on PATH: LUS now `find_package(Python3 REQUIRED)`s at configure time.
 - A desktop build that can run `make Generate2ShipOtr`, since `2ship.o2r` must be produced by
   a host ZAPD and handed to the wasm build.
 - Confirm the desktop build is green before changing anything.
@@ -329,9 +392,10 @@ Delete this path once Milestone 4 lands; it will rot otherwise.
   question of whether any splitting or streaming strategy was needed (it was not). Expect a
   similar order here; measure before deciding anything.
 
-**Exit criterion:** boots past the title into an attract demo, textured geometry, verified by
-screenshot rather than inference — an early flat-gradient frame is a transition fade, not
-proof of rendering.
+**Exit criterion:** boots past the title into the opening cutscene (MM has no attract demo;
+the flow is N64 logo → TitleSetup → `z_opening.c` running `Play_Init`), drawing textured
+Play-state geometry — verified by screenshot rather than inference, since an early
+flat-gradient frame is a transition fade, not proof of rendering.
 
 ### Milestone 5 — playable
 
@@ -382,32 +446,32 @@ Assuming the milestone order above:
 |---|---|
 | M0 toolchain + baseline | 0.5 day |
 | M1 CMake, amputations, Opus stub | 1–2 days |
-| M1 libultraship rebase (incl. Web Audio) | **3–5 days — the real risk** |
+| M1 libultraship rebase (incl. Web Audio) | ≤1 day |
+| M1 **shader re-validation under WebGL2** | **1–3 days — the real unknown** |
 | M2 frame loop, audio, thread shims | 1 day (near-copy) |
 | M3 GUI-only boot | 0.5 day |
 | M4 archives, title, audio tuning | 1–2 days |
-| M4/M5 framebuffer + depth WebGL2 fixes | **2–4 days — genuinely unknown** |
+| M4/M5 depth readback | 1–2 days |
 | M5 EmbedderBridge, host.html, docs | 2–3 days |
+| M5 storage enumeration + ModMenu healing | 1–2 days |
 | M5 test suite port | 1–2 days |
+| M5 **measure: MM perf, scene-load hitching, memory ceiling** | 1 day |
 | M6 extractor module | 2–3 days |
 
 **2–3 weeks to a playable browser build**, against what was a couple of months of discovery
-on the SoH side.
-
-## Do this first
-
-Before committing to the schedule, spike **the libultraship rebase alone**: branch a fork
-from `7f9b86a5`, apply the wasm patch, and see how much of `WebAudioAudioPlayer` survives the
-rewritten `AudioPlayer` interface. It is the only item whose cost is not already known, and
-everything downstream depends on it. If that lands cleanly, the rest is largely mechanical.
+on the SoH side. The total is much the same as the first draft's, but the risk sits in
+different places: the LUS rebase and the framebuffer effects both turned out to be small,
+and the shader rewrite, the storage surface and plain unmeasured performance took their
+place.
 
 ## Open questions
 
-- How much of the LUS audio patch survives the 80-commit gap. (See above.)
-- Whether MM's framebuffer effects can be made to work on WebGL2, or need a CVar to disable.
+- Whether LUS's rewritten `default.shader.glsl` compiles under WebGL2 with `USE_OPENGLES`.
+  This is the one part of the 80-commit gap whose cost is not known.
+- Whether depth readback needs a depth-to-color path or just a CVar.
 - Whether the synchronous ResourceManager executor is fast enough at scene load, or visibly
   hitches. Unanswered on the SoH side too — the logging confound was removed but the question
-  was never retested.
+  was never retested. Termina Field is the load to measure.
 - Memory ceiling. wasm32 caps at 4 GB and `-sMAXIMUM_MEMORY=4GB` works in current desktop
   browsers, but Safari and iOS are tighter. Measure this tree's desktop RSS before committing.
 - Performance. MM is a heavier game than OoT; entirely untested here.
