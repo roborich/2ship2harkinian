@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { playFiles, staleDesktopConfig } from "./lib/configs";
 import { BOOT_TIMEOUT, TEST_TIMEOUT } from "./lib/env";
 import { useSuite, withGame } from "./lib/suite";
+import { audioDrains } from "./lib/timing";
 
 const suite = useSuite();
 
@@ -27,4 +28,8 @@ test("a config naming backends this build lacks still boots", () =>
     withGame(suite, { inlineFiles: { "/2ship2harkinian.json": staleDesktopConfig() } }, async (game) => {
         await game.waitForEvent("scene", { timeout: BOOT_TIMEOUT });
         expect(await game.waitForPicture()).toBeGreaterThan(0.05);
+        // The null player boots and draws just as happily, so a picture proves nothing about
+        // the audio fallback. A draining queue does: only a real device consumes samples.
+        expect(audioDrains(await game.sampleStats(8000, 100))).toBe(true);
+        expect(await game.problems()).toEqual([]);
     }), TEST_TIMEOUT);

@@ -253,6 +253,22 @@ std::unordered_map<uint32_t, disabledInfo>& Menu::GetDisabledMap() {
     return disabledMap;
 }
 
+// audioBackendsMap names every platform's backends; picking one this build lacks plays through the
+// null player until the next launch, when Audio::Init falls back to the platform's own. Offer only
+// what GetAvailableAudioBackends reports, built once.
+static const std::unordered_map<Ship::AudioBackend, const char*>* AvailableAudioBackendsMap() {
+    static const std::unordered_map<Ship::AudioBackend, const char*> available = [] {
+        std::unordered_map<Ship::AudioBackend, const char*> map;
+        for (Ship::AudioBackend backend : *Ship::Context::GetRawInstance()->GetAudio()->GetAvailableAudioBackends()) {
+            if (auto named = audioBackendsMap.find(backend); named != audioBackendsMap.end()) {
+                map.insert(*named);
+            }
+        }
+        return map;
+    }();
+    return &available;
+}
+
 void Menu::MenuDrawItem(WidgetInfo& widget, uint32_t width, UIWidgets::Colors menuThemeIndex) {
     disabledTempTooltip = "This setting is disabled because: \n\n";
     disabledValue = false;
@@ -310,10 +326,9 @@ void Menu::MenuDrawItem(WidgetInfo& widget, uint32_t width, UIWidgets::Colors me
                 UIWidgets::ComboboxOptions options = {};
                 options.color = menuThemeIndex;
                 options.tooltip = "Sets the audio API used by the game. Requires a relaunch to take effect.";
-                options.disabled =
-                    Ship::Context::GetRawInstance()->GetAudio()->GetAvailableAudioBackends()->size() <= 1;
+                options.disabled = AvailableAudioBackendsMap()->size() <= 1;
                 options.disabledTooltip = "Only one audio API is available on this platform.";
-                if (UIWidgets::Combobox("Audio API", &currentAudioBackend, &audioBackendsMap, options)) {
+                if (UIWidgets::Combobox("Audio API", &currentAudioBackend, AvailableAudioBackendsMap(), options)) {
                     Ship::Context::GetRawInstance()->GetAudio()->SetCurrentAudioBackend(currentAudioBackend);
                 }
             } break;
