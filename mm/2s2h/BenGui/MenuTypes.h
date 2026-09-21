@@ -292,6 +292,8 @@ static const std::unordered_map<Ship::AudioBackend, const char*> audioBackendsMa
     { Ship::AudioBackend::WASAPI, "Windows Audio Session API" },
     { Ship::AudioBackend::COREAUDIO, "CoreAudio" },
     { Ship::AudioBackend::SDL, "SDL" },
+    // 2S2H [WASM]
+    { Ship::AudioBackend::WEBAUDIO, "Web Audio" },
     { Ship::AudioBackend::NUL, "Null" },
 };
 
