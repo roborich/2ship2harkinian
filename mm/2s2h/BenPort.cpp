@@ -37,7 +37,15 @@
 #else
 #include <SDL2/SDL_scancode.h>
 #endif
+// 2S2H [WASM] Emscripten joins the consoles in not building the ROM extractor.
+#if not defined(__SWITCH__) && not defined(__WIIU__) && not defined(__EMSCRIPTEN__)
 #include "Extractor/Extract.h"
+#endif
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include "2s2h/EmbedderBridge.h"
+#endif
 // OTRTODO
 // #include <functions.h>
 #include "2s2h/Enhancements/FrameInterpolation/FrameInterpolation.h"
@@ -142,6 +150,13 @@ static ArchiveVersion DetectArchiveVersion(std::string path, bool isO2rType);
 static bool VerifyArchiveVersion(ArchiveVersion version);
 std::string portArchivePath = "";
 static bool shipArchiveVersionMatch = false;
+#ifdef __EMSCRIPTEN__
+// 2S2H [WASM] Audio queue target; see OTRGlobals::Initialize.
+#define WASM_AUDIO_DESIRED_BUFFERED 4320
+// 2S2H [WASM] Both browser players (WebAudioAudioPlayer, and SDLAudioPlayer::DoPlay as the
+// fallback) discard a whole update when this many frames are already queued.
+#define WASM_AUDIO_DROP_THRESHOLD 6000
+#endif
 
 OTRGlobals::OTRGlobals() {
     context = Ship::Context::CreateUninitializedInstance("2 Ship 2 Harkinian", appShortName, "2ship2harkinian.json");
@@ -272,7 +287,46 @@ namespace BenGui {
 extern std::shared_ptr<BenGui::BenMenu> mBenMenu;
 }
 
+#ifdef __EMSCRIPTEN__
+// 2S2H [WASM] The checks RunExtract makes on desktop before it offers to extract, for a
+// build that cannot extract. Returns why the game cannot start, or an empty string.
+static std::string BrowserArchiveProblem(bool portArchiveMatches, ArchiveVersion game) {
+    if (!portArchiveMatches) {
+        return "2ship.o2r does not match this build (" + std::to_string(gBuildVersionMajor) + "." +
+               std::to_string(gBuildVersionMinor) + "." + std::to_string(gBuildVersionPatch) + ")";
+    }
+    if (game.major == INT16_MAX) {
+        return "no game archive: supply /mm.o2r in Module.shipFiles";
+    }
+    if (VerifyArchiveVersion(game)) {
+        return "mm.o2r was made by an incompatible version of 2Ship; extract it again";
+    }
+    return "";
+}
+#endif
+
 void OTRGlobals::RunExtract(int argc, char* argv[]) {
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] There is no ROM to extract from in a browser tab: mm.o2r and 2ship.o2r
+    // are mounted into the filesystem before main() runs. Compiling this body out also
+    // removes its `while (!extractDone)` frame-pump, which would hang a browser tab
+    // outright -- it draws popups in a loop that never returns to the event loop, so the
+    // click that would dismiss one could never arrive. See wasm-port.md.
+    //
+    // The checks do carry over. Desktop will not start on a port archive from another build
+    // or a game archive from an incompatible version, and offers to extract when there is
+    // none; without them a missing or stale mm.o2r fails at the first resource load, in a
+    // loop that never returns to the page and that no event reports.
+    std::string problem = BrowserArchiveProblem(shipArchiveVersionMatch, DetectArchiveVersion("mm.o2r", true));
+    if (!problem.empty()) {
+        SPDLOG_ERROR("Cannot start: {}", problem);
+        Ship_EmbedderError(problem.c_str());
+        // Unwinds out of main() but keeps the runtime, so the page keeps its console and can
+        // show the message. Nothing on this stack catches the unwind.
+        emscripten_exit_with_live_runtime();
+    }
+    return;
+#else
     bool extractDone = false;
     ExtractSteps extractStep = ES_PORT_ARCHIVE;
     WindowsSteps windowsStep = WS_TEMP;
@@ -607,6 +661,7 @@ void OTRGlobals::RunExtract(int argc, char* argv[]) {
 #elif defined(__WIIU__)
     Ship::WiiU::Init(appShortName);
 #endif
+#endif // __EMSCRIPTEN__
 }
 
 void OTRGlobals::Initialize() {
@@ -641,7 +696,26 @@ void OTRGlobals::Initialize() {
                                               CVarGetInteger("gSettings.AutoCaptureMouse", 1));
     context->GetWindow()->SetForceCursorVisibility(CVarGetInteger("gSettings.CursorVisibility", 0));
 
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] A much deeper buffer than desktop's 1680. Audio is synthesised once per
+    // frame on the single thread (OTRAudio_FillBuffer in Graph_ProcessGfxCommands) rather
+    // than by an audio thread that refills independently, so the buffer has to cover a whole
+    // frame interval plus any spike. At 32 kHz, 1680 samples is 52ms against a 50ms frame --
+    // around 2ms of headroom, so anything that stalls a frame (the pause screen's framebuffer
+    // capture, a synchronous resource load) is audible. Both browser players drop any update
+    // offered while 6000 frames are already queued (WASM_AUDIO_DROP_THRESHOLD); the game only
+    // asks for more while the queue is under this target and then queues up to three
+    // 560-sample updates, so the target has to leave that much room:
+    // 6000 - 3 * 560 = 4320, 135ms. See the static_assert next to SAMPLES_HIGH.
+    //
+    // This headroom is only real with the Web Audio player (the default here), whose consumer
+    // runs on the browser's audio thread. SDL's Emscripten player consumes from a main-thread
+    // callback, so with it a long frame glitches no matter how much is queued. SampleLength
+    // only matters to that fallback: it sizes SDL's ScriptProcessorNode buffer.
+    context->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = WASM_AUDIO_DESIRED_BUFFERED });
+#else
     context->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = 1680 });
+#endif
 
     SPDLOG_INFO("Starting 2 Ship 2 Harkinian version {} (Branch: {} | Commit: {})", (char*)gBuildVersion,
                 (char*)gGitBranch, (char*)gGitCommitHash);
@@ -811,6 +885,46 @@ static struct {
     bool processing;
 } audio;
 
+// 2S2H [WASM] The body of one audio update, lifted out of the thread loop so the wasm
+// build can call it straight from the frame callback. Desktop still runs it on the audio
+// thread; see OTRAudio_Thread below.
+static void OTRAudio_FillBuffer() {
+// AudioMgr_ThreadEntry(&gAudioMgr);
+//  528 and 544 relate to 60 fps at 32 kHz 32000/60 = 533.333..
+//  in an ideal world, one third of the calls should use num_samples=544 and two thirds num_samples=528
+#define SAMPLES_HIGH 560
+#define SAMPLES_LOW 528
+
+#define AUDIO_FRAMES_PER_UPDATE (R_UPDATE_RATE > 0 ? R_UPDATE_RATE : 1)
+// 3 is the maximum authentic frame divisor.
+#define MAX_AUDIO_FRAMES_PER_UPDATE 3
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] The most the queue can hold after a top-up must stay under the players'
+    // drop threshold, or whole updates of audio are thrown away.
+    static_assert(WASM_AUDIO_DESIRED_BUFFERED + MAX_AUDIO_FRAMES_PER_UPDATE * SAMPLES_HIGH <=
+                      WASM_AUDIO_DROP_THRESHOLD,
+                  "wasm audio target leaves no room for a full update below the players' drop threshold");
+#endif
+#define NUM_AUDIO_CHANNELS 2
+
+    int samples_left = AudioPlayer_Buffered();
+    u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+
+    s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS * MAX_AUDIO_FRAMES_PER_UPDATE];
+    for (int i = 0; i < AUDIO_FRAMES_PER_UPDATE; i++) {
+        AudioMgr_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * NUM_AUDIO_CHANNELS), num_audio_samples);
+    }
+
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] Count the updates the player is about to throw away, for Ship_GetStats.
+    if (samples_left >= WASM_AUDIO_DROP_THRESHOLD) {
+        Ship_EmbedderCountAudioDrop();
+    }
+#endif
+    AudioPlayer_Play((u8*)audio_buffer,
+                     num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS * AUDIO_FRAMES_PER_UPDATE));
+}
+
 void OTRAudio_Thread() {
     while (audio.running) {
         {
@@ -824,27 +938,8 @@ void OTRAudio_Thread() {
             }
         }
         std::unique_lock<std::mutex> Lock(audio.mutex);
-// AudioMgr_ThreadEntry(&gAudioMgr);
-//  528 and 544 relate to 60 fps at 32 kHz 32000/60 = 533.333..
-//  in an ideal world, one third of the calls should use num_samples=544 and two thirds num_samples=528
-#define SAMPLES_HIGH 560
-#define SAMPLES_LOW 528
 
-#define AUDIO_FRAMES_PER_UPDATE (R_UPDATE_RATE > 0 ? R_UPDATE_RATE : 1)
-#define NUM_AUDIO_CHANNELS 2
-
-        int samples_left = AudioPlayer_Buffered();
-        u32 num_audio_samples = samples_left < AudioPlayer_GetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
-
-        // 3 is the maximum authentic frame divisor.
-        s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS * 3];
-        for (int i = 0; i < AUDIO_FRAMES_PER_UPDATE; i++) {
-            AudioMgr_CreateNextAudioBuffer(audio_buffer + i * (num_audio_samples * NUM_AUDIO_CHANNELS),
-                                           num_audio_samples);
-        }
-
-        AudioPlayer_Play((u8*)audio_buffer,
-                         num_audio_samples * (sizeof(int16_t) * NUM_AUDIO_CHANNELS * AUDIO_FRAMES_PER_UPDATE));
+        OTRAudio_FillBuffer();
 
         audio.processing = false;
         audio.cv_from_thread.notify_one();
@@ -858,7 +953,9 @@ extern "C" void OTRAudio_Init() {
 
     if (!audio.running) {
         audio.running = true;
+#ifndef __EMSCRIPTEN__
         audio.thread = std::thread(OTRAudio_Thread);
+#endif
     }
 }
 
@@ -876,8 +973,10 @@ extern "C" void OTRAudio_Exit() {
     }
     audio.cv_to_thread.notify_all();
 
+#ifndef __EMSCRIPTEN__
     // Wait until the audio thread quit
     audio.thread.join();
+#endif
     for (size_t i = 0; i < gSequenceMapSize; i++) {
         free(gSequenceMap[i]);
     }
@@ -952,12 +1051,37 @@ ArchiveVersion DetectArchiveVersion(std::string fileName, bool isO2rType) {
 }
 
 extern "C" void Messagebox_ShowErrorBox(char* title, char* body) {
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] ShowErrorBox lives in the extractor, which is not built here.
+    SPDLOG_ERROR("{}: {}", title, body);
+#else
     Extractor::ShowErrorBox(title, body);
+#endif
 }
 
 bool VerifyArchiveVersion(ArchiveVersion version) {
     return version.major != INT16_MAX && version.major != gBuildVersionMajor;
 }
+
+#ifdef __EMSCRIPTEN__
+// 2S2H [WASM] An exception escaping the frame callback reaches Emscripten's
+// handleException, which calls quit_ and stops the main loop: the tab stays alive, the game
+// freezes, and the console shows only "Uncaught Exception {stack: undefined}" with no
+// message. Name it, so the next one is diagnosable rather than mysterious.
+extern "C" void Ship_RunFrameGuarded(void (*runFrame)(void)) {
+    try {
+        runFrame();
+    } catch (const std::exception& e) {
+        SPDLOG_ERROR("Unhandled exception in frame: {}", e.what());
+        Ship_EmbedderError(e.what());
+        throw;
+    } catch (...) {
+        SPDLOG_ERROR("Unhandled non-standard exception in frame");
+        Ship_EmbedderError("non-standard exception");
+        throw;
+    }
+}
+#endif
 
 extern "C" void InitOTR(int argc, char* argv[]) {
     OTRGlobals::Instance = new OTRGlobals();
@@ -979,6 +1103,9 @@ extern "C" void InitOTR(int argc, char* argv[]) {
     Rando::Init();
     GfxPatcher_ApplyNecessaryAuthenticPatches();
     DebugConsole_Init();
+#ifdef __EMSCRIPTEN__
+    Ship_InitEmbedderBridge();
+#endif
     GameInteractor::Instance->RegisterOwnHooks();
     CustomItem::RegisterHooks();
     CustomMessage::RegisterHooks();
@@ -1199,13 +1326,27 @@ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
 
 // C->C++ Bridge
 extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] Single-threaded: synthesise this update's audio inline. The handshake
+    // below would otherwise block forever on an audio thread that is never started.
+    OTRAudio_FillBuffer();
+#else
     {
         std::unique_lock<std::mutex> Lock(audio.mutex);
         audio.processing = true;
     }
 
     audio.cv_to_thread.notify_one();
+#endif
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] One frame per game tick. Interpolated frames need a loop paced by the
+    // display to be seen; this one ticks at the game's rate (graph.c), so they would be drawn
+    // back to back and only the last would reach the screen, at up to three times the cost of
+    // a tick.
+    int target_fps = 60 / R_UPDATE_RATE;
+#else
     int target_fps = OTRGlobals::Instance->GetInterpolationFPS();
+#endif
     static int last_fps;
     static int last_update_rate;
     static int time;
@@ -1246,16 +1387,21 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
     }
 
     RunCommands(commands, start_time, step, next_original_frame, count);
+#ifdef __EMSCRIPTEN__
+    Ship_EmbedderCountDraws(count);
+#endif
 
     last_fps = fps;
     last_update_rate = R_UPDATE_RATE;
 
+#ifndef __EMSCRIPTEN__
     {
         std::unique_lock<std::mutex> Lock(audio.mutex);
         while (audio.processing) {
             audio.cv_from_thread.wait(Lock);
         }
     }
+#endif
 
     bool curAltAssets = CVarGetInteger("gEnhancements.Mods.AlternateAssets", 0);
     if (prevAltAssets != curAltAssets) {

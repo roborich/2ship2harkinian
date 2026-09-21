@@ -10,7 +10,13 @@ include(CMake/2ship-cvars.cmake)
 include(CMake/lus-cvars.cmake)
 set(SPDLOG_LEVEL_TRACE 0)
 set(SPDLOG_LEVEL_OFF 6)
-set(SPDLOG_MIN_CUTOFF SPDLOG_LEVEL_TRACE CACHE STRING "cutoff at trace")
+# 2S2H [WASM] The browser build defaults to info; see the SPDLOG note in the Emscripten
+# block below. A default only: -DSPDLOG_MIN_CUTOFF=... still wins on either platform.
+if(EMSCRIPTEN)
+    set(SPDLOG_MIN_CUTOFF SPDLOG_LEVEL_INFO CACHE STRING "cutoff at info")
+else()
+    set(SPDLOG_MIN_CUTOFF SPDLOG_LEVEL_TRACE CACHE STRING "cutoff at trace")
+endif()
 set(PROJECT_BUILD_NAME "Battler Bravo" CACHE STRING "" FORCE)
 set(PROJECT_TEAM "github.com/harbourmasters" CACHE STRING "" FORCE)
 
@@ -85,8 +91,60 @@ if (CMAKE_SYSTEM_NAME MATCHES "Windows|Linux")
     endif()
 endif()
 
+# 2S2H [WASM] Provision dependencies from source; see CMake/emscripten-deps.cmake.
+if(EMSCRIPTEN)
+    include(CMake/emscripten-deps.cmake)
+
+    # Emscripten ships official ports for these; they must be on the compile line as well
+    # as the link line, since a port supplies its headers too. Applied globally so LUS and
+    # 2ship agree -- mixing a port header with a host library is a silent-corruption bug.
+    # libpng is for ColorPictograph, which writes the pictograph out as a .png.
+    set(SHIP_EMSCRIPTEN_PORTS --use-port=sdl2 --use-port=ogg --use-port=vorbis --use-port=zlib
+                              --use-port=libpng)
+    add_compile_options(${SHIP_EMSCRIPTEN_PORTS})
+    add_link_options(${SHIP_EMSCRIPTEN_PORTS})
+
+    # The decomp and the port layer both throw; without this every throw aborts.
+    add_compile_options(-fwasm-exceptions)
+    add_link_options(-fwasm-exceptions)
+    # ...and the exceptions ABI named explicitly, tree-wide, so every object and every
+    # Emscripten port agrees on it. -fwasm-exceptions leaves it at the toolchain default,
+    # which emsdk 6.0.9's libpng port script prints into its own flags as a Python bool,
+    # `True`, and emcc rejects; as an integer it builds.
+    add_compile_options(-sWASM_LEGACY_EXCEPTIONS=1)
+    add_link_options(-sWASM_LEGACY_EXCEPTIONS=1)
+
+    # Trace/debug logging is compiled out. Every spdlog call in a browser crosses into JS
+    # and lands in the devtools console, which costs orders of magnitude more than writing
+    # a line to a terminal -- resource loading alone emitted thousands of trace lines during
+    # one boot of the sibling port. This is a performance fix, not a tidiness one. The
+    # default is set near the top of this file, where the cache entry is first created;
+    # FORCE here would override -D as well.
+
+    # spdlog's bundled fmt uses consteval in a way this clang rejects. Same workaround the
+    # macOS desktop build needs; harmless, it only relaxes a compile-time format check.
+    add_compile_definitions(FMT_CONSTEVAL=constexpr)
+
+    # LUS renders through its GLES3 path, which is WebGL2. Without this the GLES3 entry
+    # points (glBlitFramebuffer, glReadBuffer, glRenderbufferStorageMultisample) do not
+    # link, since Emscripten defaults to a WebGL1 target.
+    add_link_options(-sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2)
+
+    # ...and the GLES3 path has to actually be switched on, or LUS generates desktop GLSL
+    # and every shader fails to compile against the WebGL2 context. IMGUI_IMPL_OPENGL_ES3
+    # is the same fix for ImGui's backend, which otherwise emits "#version 120".
+    set(USE_OPENGLES ON)
+    add_compile_definitions(IMGUI_IMPL_OPENGL_ES3)
+endif()
+
 # Enable the Gfx debugger in LUS to use libgfxd from ZAPDTR
-set(GFX_DEBUG_DISASSEMBLER ON)
+# 2S2H [WASM] Off for the first pass: it is a debug aid, and every dependency we do not
+# build is one less thing standing between here and a link.
+if(EMSCRIPTEN)
+    set(GFX_DEBUG_DISASSEMBLER OFF)
+else()
+    set(GFX_DEBUG_DISASSEMBLER ON)
+endif()
 
 # Tell LUS we're using F3DEX_GBI_2 (in a way that doesn't break libgfxd)
 set(GBI_UCODE F3DEX_GBI_2)
@@ -204,13 +262,20 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU|MSVC")
     endif()
 endif()
 
-add_subdirectory(ZAPDTR/ZAPD ${CMAKE_BINARY_DIR}/ZAPD)
-add_subdirectory(OTRExporter)
+# 2S2H [WASM] ZAPD and OTRExporter are host tools that turn a ROM into .o2r archives. A
+# wasm build consumes the archives someone else already produced, so they are not part of
+# the cross build (see wasm-port.md, "Archives are provided, never extracted").
+if(NOT EMSCRIPTEN)
+    add_subdirectory(ZAPDTR/ZAPD ${CMAKE_BINARY_DIR}/ZAPD)
+    add_subdirectory(OTRExporter)
+endif()
 add_subdirectory(mm)
 
+if(NOT EMSCRIPTEN)
 set_property(TARGET 2ship PROPERTY APPIMAGE_DESKTOP_FILE_TERMINAL YES)
 set_property(TARGET 2ship PROPERTY APPIMAGE_DESKTOP_FILE "${CMAKE_SOURCE_DIR}/mm/linux/2s2h.desktop")
 set_property(TARGET 2ship PROPERTY APPIMAGE_ICON_FILE "${CMAKE_BINARY_DIR}/2s2hIcon.png")
+endif()
 
 if("${CMAKE_SYSTEM_NAME}" STREQUAL "Linux")
 install(FILES "${CMAKE_BINARY_DIR}/mm/2ship.o2r" DESTINATION . COMPONENT ship)
@@ -225,6 +290,11 @@ install(DIRECTORY "${CMAKE_SOURCE_DIR}/mm/assets/xml/" DESTINATION ./assets/xml 
 endif()
 
 find_package(Python3 COMPONENTS Interpreter)
+
+# 2S2H [WASM] The asset-generation targets all shell out to ZAPD, which is not part of the
+# cross build. Generate the .o2r archives with a desktop build and hand them to the wasm
+# build instead.
+if(NOT EMSCRIPTEN)
 
 # Target to generate OTRs
 add_custom_target(
@@ -259,6 +329,8 @@ add_custom_target(
     COMMENT "Generating 2ship.o2r..."
     DEPENDS ZAPD
 )
+
+endif() # NOT EMSCRIPTEN
 
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
 file(COPY ${CMAKE_SOURCE_DIR}/mm/linux/2s2hIcon.png DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

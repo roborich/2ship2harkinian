@@ -105,6 +105,27 @@ void aLoadBufferImpl(const void* source_addr, uint16_t dest_addr, uint16_t nbyte
 #endif
 }
 
+#ifdef __EMSCRIPTEN__
+// 2S2H [WASM] Opus and OpusFile have no Emscripten port and no source build here, so the
+// two entry points that use them decode to silence. Only custom *streamed Opus* music is
+// affected: the game's own sequenced audio is ADPCM, and custom streamed Ogg Vorbis, MP3
+// and FLAC all go through dr_libs and keep working. A stub rather than a compile-out
+// because both symbols are reached from the decomp's audio path.
+struct OggOpusFile;
+
+void aOPUSdecImpl(void* source_addr, uint16_t dest_addr, uint16_t nbytes, struct OggOpusFile** decState, int32_t pos,
+                  uint32_t size) {
+    (void)source_addr;
+    (void)decState;
+    (void)pos;
+    (void)size;
+    memset(BUF_S16(dest_addr), 0, ROUND_DOWN_16(nbytes));
+}
+
+void aOPUSFree(struct OggOpusFile* opusFile) {
+    (void)opusFile;
+}
+#else
 #include <opus/opus.h>
 #include <opusfile.h>
 
@@ -131,6 +152,7 @@ void aOPUSdecImpl(void* source_addr, uint16_t dest_addr, uint16_t nbytes, struct
 void aOPUSFree(struct OggOpusFile* opusFile) {
     op_free(opusFile);
 }
+#endif // __EMSCRIPTEN__
 
 void aSaveBufferImpl(uint16_t source_addr, int16_t* dest_addr, uint16_t nbytes) {
     memcpy(dest_addr, BUF_S16(source_addr), ROUND_DOWN_16(nbytes));

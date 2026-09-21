@@ -68,7 +68,8 @@ if (NOT TARGET libultraship)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libultraship ${CMAKE_BINARY_DIR}/libultraship)
 endif()
 
-if (NOT TARGET ZAPDLib)
+# 2S2H [WASM] ZAPD is a host tool; a wasm build consumes pre-built .o2r archives.
+if (NOT TARGET ZAPDLib AND NOT EMSCRIPTEN)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../ZAPDTR/ZAPD ${CMAKE_BINARY_DIR}/ZAPD)
 endif()
 
@@ -113,7 +114,9 @@ endif()
 
 list(FILTER ship__ EXCLUDE REGEX "2s2h/Extractor/*")
 
-if(NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|CafeOS")
+# 2S2H [WASM] Emscripten joins the consoles in taking headers only: the ROM extractor
+# links against ZAPD, which is not part of the cross build.
+if(NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|CafeOS" AND NOT EMSCRIPTEN)
     file(GLOB_RECURSE ship__Extractor RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
         "2s2h/Extractor/*.c"
         "2s2h/Extractor/*.cpp"
@@ -447,12 +450,19 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
             >
             $<$<COMPILE_LANGUAGE:CXX>:-fpermissive>
             $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-enum-enum-conversion>
-            -pthread
+            # 2S2H [WASM] -pthread under Emscripten requests a shared-memory build, which
+            # needs SharedArrayBuffer and COOP/COEP. The wasm target is single-threaded.
+            $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:-pthread>
 	    ${CPU_OPTION}
         )
 
         target_link_options(${PROJECT_NAME} PRIVATE
-            -pthread
+            $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:-pthread>
+            # 2S2H [WASM] Kept for the Emscripten link too, though there it exports symbols
+            # nothing calls. Exported functions are never inlined, and without that Binaryen
+            # inlines small helpers thousands of times into large table builders, which V8
+            # then crashes the renderer compiling. Dropping the exports needs the Binaryen
+            # inlining limit below to prevent that first.
             -Wl,-export-dynamic
         )
     endif()
@@ -518,7 +528,8 @@ endif()
 if (CMAKE_GENERATOR MATCHES "Visual Studio")
     set(VS_COPY_ASSETS_CMD ${CMAKE_COMMAND} -E copy_directory_if_different $<TARGET_FILE_DIR:2ship>/assets ${CMAKE_BINARY_DIR}/mm/assets)
 endif()
-if(NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|CafeOS")
+# 2S2H [WASM] The extractor's xml recipes are only useful next to a ZAPD binary.
+if(NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|CafeOS" AND NOT EMSCRIPTEN)
     add_custom_command(
         TARGET ${PROJECT_NAME}
         POST_BUILD
@@ -535,7 +546,8 @@ endif()
 add_dependencies(${PROJECT_NAME}
     libultraship
 )
-if(NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|CafeOS")
+# 2S2H [WASM] Emscripten joins the consoles in not building ZAPD.
+if(NOT CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|CafeOS" AND NOT EMSCRIPTEN)
 add_dependencies(${PROJECT_NAME}
     ZAPDLib
 )
@@ -582,6 +594,14 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
         SDL2::SDL2
         -lglad
         Threads::Threads
+    )
+elseif(EMSCRIPTEN)
+    # 2S2H [WASM] SDL2, Ogg and Vorbis come from Emscripten ports (requested globally in
+    # the root CMakeLists), so there is nothing to find_package here and no ZAPDLib.
+    # Opus and OpusFile have no Emscripten port; the two functions that use them are
+    # stubbed in mm/2s2h/mixer.c, which costs custom streamed Opus audio and nothing else.
+    set(ADDITIONAL_LIBRARY_DEPENDENCIES
+        "libultraship;"
     )
 elseif(CMAKE_SYSTEM_NAME STREQUAL "CafeOS")
     find_package(SDL2 REQUIRED)
@@ -631,6 +651,8 @@ endif()
 
 find_program(CURL NAMES curl DOC "Path to the curl program.  Used to download files.")
 execute_process(COMMAND ${CURL} -sSfL https://raw.githubusercontent.com/gabomdq/SDL_GameControllerDB/master/gamecontrollerdb.txt -o ${CMAKE_BINARY_DIR}/gamecontrollerdb.txt OUTPUT_VARIABLE RESULT)
+# 2S2H [WASM] osContInit loads this off disk; without it SDL_Init still succeeds and a
+# missing file only logs. Preloaded into the VFS below so it does not.
 
 if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
 configure_file( ${CMAKE_CURRENT_SOURCE_DIR}/macosx/Info.plist.in ${CMAKE_BINARY_DIR}/macosx/Info.plist @ONLY)
@@ -678,4 +700,68 @@ wut_create_wuhb(${PROJECT_NAME}
 
 INSTALL(FILES ${CMAKE_CURRENT_BINARY_DIR}/2s2h.rpx ${CMAKE_CURRENT_BINARY_DIR}/2s2h.wuhb DESTINATION . COMPONENT 2s2h)
 
+endif()
+
+################################################################################
+# 2S2H [WASM] Emscripten packaging
+################################################################################
+if(EMSCRIPTEN)
+    # Where the pre-built 2ship.o2r lives. It is produced by a desktop build (ZAPD is a
+    # host tool), then packaged into the module's virtual filesystem at the path
+    # LocateFileAcrossAppDirs searches. Override to point at your own copy.
+    set(SHIP_WASM_ASSET_DIR "${CMAKE_SOURCE_DIR}/build-cmake/mm" CACHE PATH
+        "Directory holding a pre-built 2ship.o2r for the wasm build")
+
+    # 2ship.o2r is the only game file the build carries: it is built from this repo and
+    # version-checked against gBuildVersion, so a host supplying it could only pair a stale
+    # port archive with a newer binary. Everything else -- mm.o2r, the config, saves, mods --
+    # the page embedding the build hands over as bytes (Module.shipFiles; see
+    # mm/wasm/HOST-API.md and host.html). Nothing extracted from a ROM ends up in the output.
+    if(NOT EXISTS "${SHIP_WASM_ASSET_DIR}/2ship.o2r")
+        message(FATAL_ERROR
+            "2ship.o2r not found in ${SHIP_WASM_ASSET_DIR}. Build it from a desktop build "
+            "(`cmake --build build-cmake --target Generate2ShipOtr`) and point "
+            "-DSHIP_WASM_ASSET_DIR at it.")
+    endif()
+
+    target_link_options(${PROJECT_NAME} PRIVATE
+        # SHELL: keeps each flag with its path. CMake de-duplicates repeated identical
+        # link-option tokens, and with two preloads `--preload-file` appears twice, so
+        # without this only the first archive survives.
+        "SHELL:--preload-file ${SHIP_WASM_ASSET_DIR}/2ship.o2r@/2ship.o2r"
+        "SHELL:--preload-file ${CMAKE_BINARY_DIR}/gamecontrollerdb.txt@/gamecontrollerdb.txt"
+        -sFORCE_FILESYSTEM=1
+        # The host page writes game files into MEMFS during preRun. HEAPU8 lets it read
+        # the wasm heap size (memtrace); Emscripten keeps Module.HEAPU8 current across
+        # memory growth only when it is exported.
+        "SHELL:-sEXPORTED_RUNTIME_METHODS=FS,callMain,ccall,cwrap,HEAPU8"
+        # Keep function names in the wasm so a browser stack trace reads Menu::Draw rather
+        # than $func11146. Costs a name section, nothing at runtime.
+        --profiling-funcs
+        # Binaryen inlines any function that has exactly one caller, whatever its size. In
+        # the sibling port that folded 35 table builders into one 3.3 MB function, and V8's
+        # optimising compiler died on it a few minutes into every session. Cap the size of
+        # single-caller functions that get inlined; the biggest ones are table builders that
+        # gain nothing from it.
+        "SHELL:-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=1000"
+        -sALLOW_MEMORY_GROWTH=1
+        -sINITIAL_MEMORY=536870912
+        -sSTACK_SIZE=4194304
+        -sEXIT_RUNTIME=0
+    )
+
+    # --preload-file inputs reach the link only as options, and CMake does not treat those
+    # as dependencies: a regenerated 2ship.o2r would leave the target up to date and the
+    # .data file stale.
+    set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS
+        "${SHIP_WASM_ASSET_DIR}/2ship.o2r")
+
+    set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX ".js")
+
+    # The host page and the contract it implements ship next to the artifacts, so "the wasm
+    # build" a host copies is one directory.
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/wasm/host.html
+                   ${CMAKE_CURRENT_BINARY_DIR}/host.html COPYONLY)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/wasm/HOST-API.md
+                   ${CMAKE_CURRENT_BINARY_DIR}/HOST-API.md COPYONLY)
 endif()

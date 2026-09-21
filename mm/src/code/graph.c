@@ -8,6 +8,12 @@
 #include <libultraship/bridge/windowbridge.h>
 #include <string.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include "2s2h/EmbedderBridge.h"
+void Ship_RunFrameGuarded(void (*runFrame)(void));
+#endif
+
 // Variables are put before most headers as a hacky way to bypass bss reordering
 FaultAddrConvClient sGraphFaultAddrConvClient;
 FaultClient sGraphFaultClient;
@@ -404,7 +410,11 @@ void RunFrame() {
 
             Graph_StartFrame();
 
-            PadMgr_ThreadEntry(&gPadMgr);
+            // 2S2H [WASM] No argument: PadMgr_ThreadEntry is defined `void
+            // PadMgr_ThreadEntry()` (padmgr.c) and works off sPadMgrInstance. The old
+            // argument was ignored, but left graph.c and padmgr.c disagreeing about the
+            // function's type, which wasm-ld reported as a signature mismatch.
+            PadMgr_ThreadEntry();
 
             Graph_Update(&runFrameContext.gfxCtx, runFrameContext.gameState);
             // ticksB = GetPerfCounter();
@@ -426,10 +436,77 @@ void RunFrame() {
     Graph_Destroy(&runFrameContext.gfxCtx);
 }
 
+#ifdef __EMSCRIPTEN__
+// 2S2H [WASM] When the next tick is due. Ticks are scheduled against this running deadline
+// rather than "period after this one started", so neither setTimeout's lateness nor the
+// whole-millisecond timer resolution accumulates into a slow or fast game.
+typedef struct {
+    double nextTickMs;
+    s32 updateRate;
+} TickClock;
+
+// Advances the clock past the tick that started at tickStartMs and returns the delay, in ms
+// from that start, until the next one. A new update rate, or a loop more than three ticks
+// behind (a background tab, a long synchronous load), restarts the deadline from now rather
+// than racing to catch up.
+static s32 TickClock_Advance(TickClock* clock, double tickStartMs, s32 updateRate) {
+    double periodMs = 1000.0 * updateRate / 60.0;
+    if (updateRate != clock->updateRate || clock->nextTickMs < tickStartMs - 3.0 * periodMs) {
+        clock->updateRate = updateRate;
+        clock->nextTickMs = tickStartMs;
+    }
+    clock->nextTickMs += periodMs;
+    double delayMs = clock->nextTickMs - tickStartMs;
+    return delayMs > 0.0 ? (s32)(delayMs + 0.5) : 0;
+}
+
+// 2S2H [WASM] A browser tab must return to its event loop to draw anything or receive
+// input, so the game cannot own an infinite loop. RunFrame() is already a resumable state
+// machine (see RunFrameContext above), which makes it usable as a callback directly.
+//
+// The tick rate is the game's, not the display's. It is not constant: the game runs at
+// 60/R_UPDATE_RATE Hz and GameState_SetFramerateDivisor changes R_UPDATE_RATE per game
+// state, so the delay to the next callback is re-derived after every frame (see below).
+// setTimeout-driven rather than requestAnimationFrame, which would run at the display's
+// rate and desynchronise both the game speed and the audio. See wasm-port.md.
+static void Graph_EmscriptenFrame(void) {
+    static TickClock sClock;
+    // Emscripten's setTimeout scheduler measures the delay from when this callback started.
+    double tickStartMs = emscripten_get_now();
+
+    if (!WindowIsRunning()) {
+        Ship_EmbedderQuit();
+        emscripten_cancel_main_loop();
+        return;
+    }
+    Ship_RunFrameGuarded(RunFrame);
+    Ship_EmbedderAfterFrame();
+
+    // 2S2H [WASM] R_UPDATE_RATE is the N64's vsync divisor: the game runs at
+    // 60/R_UPDATE_RATE Hz and synthesises R_UPDATE_RATE audio buffers per frame, so the two
+    // cancel and audio always comes out at 32 kHz. Game states change it -- 3 while playing,
+    // 2 in the pause menu and in message boxes, 1 on the title, file select, opening and
+    // map-select screens -- and a loop pinned to one rate breaks that cancellation: at a
+    // fixed 20 Hz, pausing would produce 2/3 of the samples per second and the music would
+    // play slow, the title screen 1/3.
+    if (R_UPDATE_RATE > 0) {
+        emscripten_set_main_loop_timing(EM_TIMING_SETTIMEOUT, TickClock_Advance(&sClock, tickStartMs, R_UPDATE_RATE));
+    }
+}
+#endif
+
 void Graph_ThreadEntry(void* arg0) {
+#ifdef __EMSCRIPTEN__
+    // 20 Hz is the R_UPDATE_RATE == 3 case; Graph_EmscriptenFrame re-derives the rate from
+    // R_UPDATE_RATE after each frame, so this is only the starting value.
+    // simulate_infinite_loop = 1: unwinds this stack without running destructors, so
+    // everything Main() set up stays alive for the callbacks. It does not return.
+    emscripten_set_main_loop(Graph_EmscriptenFrame, 20, 1);
+#else
     while (WindowIsRunning()) {
         RunFrame();
     }
+#endif
 }
 
 // #region 2S2H [Debugging] Debugging methods for viewing file/line info in the renderer.

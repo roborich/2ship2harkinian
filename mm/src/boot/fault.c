@@ -52,6 +52,9 @@
 #include "macros.h"
 #include "global.h"
 #include <stdio.h>
+#ifdef __EMSCRIPTEN__
+#include <stdlib.h> // abort, for Fault_AddHungupAndCrashImpl
+#endif
 
 #if 0
 FaultMgr* sFaultInstance;
@@ -1169,7 +1172,21 @@ void Fault_HangupFaultClient(const char* exp1, const char* exp2) {
  * or both may be NULL.
  */
 void Fault_AddHungupAndCrashImpl(const char* exp1, const char* exp2) {
+#ifdef __EMSCRIPTEN__
+    // 2S2H [WASM] `assert(0)` is compiled out by NDEBUG in a Release build, so this
+    // function returned and all 24 call sites carried on with the corrupted state that
+    // brought them here. On desktop that is survivable-ish; in a browser tab there is no
+    // debugger to attach and the failure surfaces later as an unrelated mystery. abort()
+    // traps in wasm, which Emscripten turns into a stack trace the page can report.
+    //
+    // (The original decomp crashed via `*(u32*)0x11111111 = 0`, commented out below. That
+    // would not work here either: in linear memory that is a *valid* address ~286 MB in,
+    // so it would not trap at all.)
+    fprintf(stderr, "Fault: %s %s\n", exp1 != NULL ? exp1 : "", exp2 != NULL ? exp2 : "");
+    abort();
+#else
     assert(0);
+#endif
     // FaultClient client;
     // s32 pad;
     //
