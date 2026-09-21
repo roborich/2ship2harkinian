@@ -1,0 +1,414 @@
+# 2 Ship 2 Harkinian in the browser — WebAssembly port plan
+
+Working plan for branch `wasm` (2S2H `61384c2c8`; LUS pinned at `7f9b86a5`).
+Goal: 2Ship running in a browser tab, single-threaded, with the host page supplying the
+game files.
+
+This is a **second** port of the same shape. Ship of Harkinian was taken to a playable
+browser build on `roborich/Shipwright` branch `wasm` (65 commits off `cb71e22a7`), and the
+findings, traps and measurements from that work are written up in that repo's
+`wasm-port.md` and `wasm-rom-extract.md`. Read them first — most of the expensive
+discovery is already paid for. This document records what carries over, what does not, and
+what is genuinely new here.
+
+## Scope for the first pass
+
+Same narrow scope that made the SoH port a port and not a rewrite:
+
+- **Archives are provided, never extracted, by the game module.** The page hands over
+  `mm.o2r`; the build ships a host-generated `2ship.o2r` alongside it, version-pinned.
+  In-browser ROM extraction is a *separate module* (`2ship-extract.js`), built from the
+  same tree, run by the host in a worker. Milestone 6.
+- **Keyboard first, controllers later.** LUS treats keyboard as a first-class input device;
+  Emscripten's SDL2 has a working Gamepad-API backend, so controllers are a bonus, not a
+  blocker.
+- **Enhancements and GUI stay compiled in.** 316 files under `mm/` call `CVarGet*`, and
+  enhancements are wired through GameInteractor hooks, not isolated behind a flag. Removing
+  them is strictly more work than keeping them. See "What not to strip".
+- **Single-threaded.** No pthreads, no SharedArrayBuffer, no COOP/COEP.
+- **One rendered frame per game tick.** Interpolated sub-frames need a second yield point
+  inside `RunCommands`, which the frame state machine does not have. Out of scope; see §1.
+
+## Why this is tractable: the preconditions hold
+
+Four things decide whether this approach works at all. All four are true in this tree.
+
+### 1. The frame loop is already re-entrant
+
+`mm/src/code/graph.c:363-431` — `RunFrame()` is a resumable state machine, structurally
+identical to SoH's:
+
+```c
+static struct RunFrameContext {
+    GraphicsContext gfxCtx;
+    GameState* gameState;
+    GameStateOverlay* nextOvl;
+    GameStateOverlay* ovl;
+    int state;
+} runFrameContext;
+```
+
+with `switch (runFrameContext.state) { case 1: goto nextFrame; }` at the top, and
+`Graph_ThreadEntry` (`:429`) reduced to `while (WindowIsRunning()) RunFrame();`.
+
+Consequence: **no Asyncify** (binary size and speed) and **no `-sPROXY_TO_PTHREAD`**
+(which would drag in SharedArrayBuffer and COOP/COEP response headers). `RunFrame` becomes
+an `emscripten_set_main_loop` callback almost verbatim. The SoH patch to its `graph.c` is a
+near-literal copy.
+
+There is exactly one yield point and it sits *after* `Graph_ProcessGfxCommands` returns, so
+every interpolated sub-frame of a tick is rendered synchronously and only the last one is
+presented. Hence "one frame per tick" above.
+
+### 2. The tick rate is not constant, and audio depends on it
+
+`R_UPDATE_RATE` is `SREG(30)` (`mm/include/regs.h:71`), set through
+`GameState_SetFramerateDivisor` (`mm/src/code/game.c:41-45`). The game runs at
+`60/R_UPDATE_RATE` Hz *and* synthesises `R_UPDATE_RATE` audio buffers per frame
+(`AUDIO_FRAMES_PER_UPDATE`, `mm/2s2h/BenPort.cpp:833`), so the two cancel and audio always
+lands at 32 kHz.
+
+MM changes the divisor in **more** places than OoT does:
+
+| Divisor | Rate | Sites |
+|---|---|---|
+| 3 | 20 Hz | gameplay (`game.c:235`), `z_play.c:784,831,865,894,930,953`, kaleido NES ×5 |
+| 2 | 30 Hz | pause setup (`z_kaleido_setup.c:138`), message (`z_message.c:5993`) |
+| 1 | 60 Hz | title (`z_title.c:245`), select (`z_select.c:1133`), opening (`z_opening.c:59`), file choose (`z_file_choose_NES.c:2617`), `z_play.c:1001` |
+
+A loop pinned to one rate breaks the cancellation and audio comes out at
+`rate * R_UPDATE_RATE * ~533` samples/sec — wrong speed in every state but the one it was
+pinned to. The frame callback must re-derive its delay from `R_UPDATE_RATE` after every
+frame. SoH's `TickClock_Advance` (a running deadline, so `setTimeout` lateness does not
+accumulate, with a restart when the rate changes or the loop falls three ticks behind) ports
+as-is.
+
+### 3. The N64 threads are inert
+
+`mm/CMakeLists.txt:141` does `list(FILTER src__ EXCLUDE REGEX "src/libultra/os/")`, so the
+decomp's thread implementation is never compiled — what links are empty stubs.
+`mm/src/code/main.c:119` creates and starts the graph "thread" (both no-ops) and then calls
+`Graph_ThreadEntry(0)` directly on the main thread at `:123`. LUS's message queues are
+non-blocking stubs.
+
+### 4. Real threads are few, and fewer than SoH's
+
+Under Emscripten without `-pthread`, every `std::thread` construction aborts. Each needs a
+shim:
+
+| Thread | Where | Shim |
+|---|---|---|
+| Audio | `mm/2s2h/BenPort.cpp:861` | not started; fill inline from the frame callback |
+| LUS ResourceManager pool | libultraship | synchronous executor (LUS patch) |
+| spdlog async logger | libultraship `Context.cpp` | synchronous sink (LUS patch) |
+| Extractor pool *(desktop only)* | `mm/2s2h/BenPort.cpp:333` | inside `RunExtract`, compiled out |
+| Custom-audio decoders *(on demand)* | `mm/2s2h/resource/importer/AudioSampleFactory.cpp:314-322` | decode inline |
+
+2Ship has **no SaveManager thread pool** and **no networking stack** — no Anchor, no Sail,
+and CrowdControl is already behind `ENABLE_CROWD_CONTROL` (`mm/2s2h/BenPort.cpp:45-48`) with
+its source directory absent from the tree. That is three of SoH's shims gone.
+
+## What 2Ship gets for free, and what it does not
+
+### Ports nearly verbatim from the SoH branch
+
+- **CMake.** `CMakeLists.txt` here has the same skeleton as SoH's: `GFX_DEBUG_DISASSEMBLER`
+  at `:89`, `GBI_UCODE` at `:92`, `add_subdirectory(libultraship)` at `:186`, ZAPD +
+  OTRExporter + game at `:207-209`. `mm/CMakeLists.txt` has the same `if (NOT TARGET
+  ZAPDLib)` at `:71`, the same `list(FILTER … Extractor)` idiom at `:114-128`, and the same
+  `-pthread` in the final GCC/Clang `else()` at `:450,455`. SoH's `CMake/emscripten-deps.cmake`
+  (FetchContent with `OVERRIDE_FIND_PACKAGE` for zlib, libzip, nlohmann_json, tinyxml2,
+  spdlog) is game-agnostic and copies over unchanged.
+- **`graph.c`** — the frame callback and tick clock.
+- **The audio handshake.** `mm/2s2h/BenPort.cpp:807-880` (the thread + condition variables)
+  and `:1201-1207` / `:1254-1256` (the `audio.processing` handshake inside
+  `Graph_ProcessGfxCommands`) are line-for-line the SoH code. Same split of the update body
+  into an `OTRAudio_FillBuffer` that desktop calls from the thread and wasm calls inline.
+  Without touching *both* sites, the first frame deadlocks on an audio thread that was never
+  started.
+- **Audio buffer sizing.** `InitAudio` at `mm/2s2h/BenPort.cpp:644` uses the same
+  `DesiredBuffered = 1680` (≈52 ms against a 50 ms frame — about 2 ms of slack). Same deeper
+  target for the browser, same `static_assert` tying it to the player's drop threshold.
+- **Opus stubs.** `mm/2s2h/mixer.c:108-132` uses `opus`/`opusfile`, which have no Emscripten
+  port. Stub `aOPUSdecImpl` / `aOPUSFree` to silence; it costs custom streamed Opus audio and
+  nothing else. Ogg and Vorbis have ports.
+- **The whole `wasm/` directory shape** — `host.html`, `HOST-API.md`, `EMBEDDING.md`, and the
+  bun + Playwright test harness (`lib/wasm.ts`, `lib/server.ts`, `lib/game.ts`, `lib/timing.ts`
+  and the smoke/boot/audio/timing/soak/artifacts suites). The harness is game-agnostic; only
+  the assertions are not.
+
+### Needs real work
+
+1. **The libultraship rebase — the biggest unknown.**
+   This tree pins LUS `7f9b86a5` (2026-08-30). The SoH wasm patch is based on `fdcaf633`
+   (2026-03-25), **80 commits behind**, and upstream rewrote precisely what the patch
+   touches:
+
+   | File | Upstream churn between the pins |
+   |---|---|
+   | `include/ship/audio/AudioPlayer.h` | +114 |
+   | `include/ship/audio/Audio.h` | +66 |
+   | `include/ship/audio/SoundMatrixDecoder.h` | +73 (new surround path) |
+   | `src/ship/Context.cpp` | +225 |
+   | `src/ship/config/Config.cpp` | +147 |
+   | `src/fast/backends/gfx_opengl.cpp` | +97 |
+   | `src/fast/backends/gfx_sdl2.cpp` | +86 |
+
+   The wasm patch itself is small — 569 lines across 14 files — but `WebAudioAudioPlayer`
+   (61 lines C++ + a 291-line AudioWorklet) implements the old `AudioPlayer` interface.
+   Expect to reimplement rather than cherry-pick. Upstream LUS has **no** Emscripten support
+   at all, so there is nothing to build on and nothing to conflict with conceptually.
+
+   This work benefits both ports — SoH and 2Ship consume the same LUS — so do it once, on a
+   fork branched from `7f9b86a5`, and point both trees at it.
+
+2. **`Extract.cpp` → `RomInfo` split.** SoH lifted the pure ROM/CRC checks out of the GUI
+   extractor so the worker module could reuse them without ZAPD's GUI dependencies.
+   `mm/2s2h/Extractor/Extract.cpp` (639 lines) has the same `CallZapd` → `zapd_report` shape
+   (`:569-624`) and the same `FastCrc32C.c`, so the same refactor applies — but against MM's
+   ROM table, by hand.
+
+3. **`EmbedderBridge` retargeting.** The mechanism (DOM `CustomEvent('soh')` out,
+   `ccall('…_RunConsoleCommand')` in, `…_GetStats` for tests) is generic and copies over. The
+   *payloads* are OoT-shaped: `scene { sceneNum, entranceIndex }`, `load-game { fileNum }`,
+   and a `warp` console command that resolves age and time of day. MM needs its own vocabulary
+   — day of the three-day cycle, not age.
+
+4. **Framebuffer effects — the one place MM is harder than OoT.**
+   `mm/2s2h/framebuffer_effects.c` leans on `gfx_create_framebuffer` / framebuffer copies far
+   more than OoT does (pause blur, motion blur, the reusable and N64-res buffers at `:19-31`).
+   Two known WebGL2 gaps in LUS are still open and MM will hit them harder:
+   - `ReadFramebufferToCPU` uses `GL_UNSIGNED_SHORT_5_5_5_1`; WebGL2 `readPixels` permits
+     only RGBA/UNSIGNED_BYTE.
+   - Depth readback is compiled out under `USE_OPENGLES`, leaving `depth_stencil_value`
+     uninitialized. Consumers here: `mm/src/code/z_kankyo.c:532` (sun occlusion) and
+     `mm/src/code/z_lights.c:411`, both reached through `OTRGetPixelDepthPrepare` /
+     `OTRGetPixelDepth` (`mm/2s2h/BenPort.cpp:1277-1299`).
+
+   SoH deferred both. Here they should be budgeted as real work: a depth-to-color path, or a
+   CVar that disables the effects.
+
+5. **Exception handling.** 28 `throw` sites and 15 `std::stoi` call sites under `mm/2s2h`.
+   Emscripten disables exception catching by default and any `throw` aborts; budget
+   `-fwasm-exceptions`, tree-wide, with `-sWASM_LEGACY_EXCEPTIONS=1` named explicitly so every
+   object and every Emscripten port agrees on the ABI.
+
+### Traps that do *not* apply here
+
+- **No `fault.c`.** SoH's `Fault_AddHungupAndCrashImpl` crashes deliberately via
+  `*(u32*)0x11111111 = 0`, which in linear memory is a *valid* address ~286 MB in — no trap,
+  execution continues with corrupted state. This tree has no `fault.c`.
+- **No networking amputation.** See §4 above.
+
+### Traps that do apply, already diagnosed
+
+Do not re-discover these. From the SoH branch:
+
+- **`USE_OPENGLES` defaults to OFF** in LUS, so a naive Emscripten build compiles the
+  *desktop* GL path and generates desktop GLSL against a WebGL2 context. Every shader fails.
+  Set `USE_OPENGLES ON` plus `IMGUI_IMPL_OPENGL_ES3` for ImGui's backend, and
+  `-sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2` so the GLES3 entry points resolve.
+- **No GL context version is requested** outside `__APPLE__` in `gfx_sdl2.cpp`, so SDL hands
+  back WebGL1. Request `SDL_GL_CONTEXT_MAJOR_VERSION=3` and the ES profile.
+- **`glewInit()` is guarded `#if !defined(__linux__)`** and Emscripten does not define
+  `__linux__`, so it compiles in. Same trap in `Context::GetAppBundlePath` (`/proc/self/exe`)
+  and the crash handler.
+- **`-pthread` in the final `else()`** requests a *shared-memory* build under Emscripten —
+  exactly the SharedArrayBuffer/COOP-COEP dependency this target exists to avoid. Guard it
+  (`mm/CMakeLists.txt:450,455`).
+- **CMake de-duplicates repeated `--preload-file` tokens**, silently dropping the second
+  archive. Use `SHELL:` so each flag stays with its path.
+- **Browser logging dominates boot time.** One SoH boot emitted 7,670 console lines; each
+  spdlog call crosses into JS and lands in devtools. Compiling trace/debug out took the same
+  boot to 28 lines. Default `SPDLOG_MIN_CUTOFF` to info for this target. This is a
+  performance fix, not a tidiness one — and it means "is the synchronous ResourceManager fast
+  enough" cannot be measured until it is done.
+- **Binaryen inlines any single-caller function regardless of size.** In SoH that folded 35
+  `RegionTable_Init_*` builders into one 3.3 MB function, and V8's TurboFan crashed the
+  renderer compiling it a few minutes into every session ("Aw, Snap", `EXC_BREAKPOINT` on a
+  `ThreadPoolForegroundWorker`). Fix in the link:
+  `-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=1000`. Reproduce in seconds
+  with `--js-flags="--no-wasm-dynamic-tiering --no-wasm-lazy-compilation"`. 2Ship's Rando
+  tables are the obvious candidate for the same shape.
+- **`-Wl,-export-dynamic` must stay** until that inlining cap is in place: exported functions
+  are never inlined, and it was masking the problem above.
+- **SDL's Emscripten audio callback runs on the main thread** (a ScriptProcessorNode
+  `onaudioprocess`), so any frame longer than ~20-40 ms crackles *however much* audio is
+  queued — every `DesiredBuffered` value tunes a queue upstream of the real bottleneck. The
+  fix is the LUS `WebAudioAudioPlayer`: an AudioWorklet fed by `postMessage` with transferred
+  buffers, no SharedArrayBuffer, so the consumer runs on the audio thread. SDL stays as the
+  fallback.
+- **Indirect-call signature traps.** wasm traps when a call's declared and actual signatures
+  differ; the decomp does this freely and native builds tolerate it. Enumerate with a native
+  `-fsanitize=function` build *before* chasing them in a browser.
+- **IDBFS is write-behind.** Nothing reaches IndexedDB until `FS.syncfs()`, and the config
+  save in `~Context` never runs in a browser tab. (SoH sidestepped this entirely by making
+  the host page own all storage — see Milestone 5.)
+
+## The work
+
+Milestones mirror SoH's, which were chosen so each one has a single possible cause of
+failure. Do not reorder them.
+
+### Milestone 0 — toolchain and baseline
+
+- `git submodule update --init --recursive` (all three submodules are currently unchecked-out
+  in this tree).
+- emsdk 6.0.9 (`~/emsdk`), the version the SoH build used.
+- A desktop build that can run `make Generate2ShipOtr`, since `2ship.o2r` must be produced by
+  a host ZAPD and handed to the wasm build.
+- Confirm the desktop build is green before changing anything.
+
+### Milestone 1 — compiles and links
+
+- Fork libultraship from `7f9b86a5`; port the wasm patch (see "Needs real work" §1). Land
+  the non-audio parts first — `USE_OPENGLES`, the GL context request, the synchronous
+  ResourceManager and spdlog executors, the libzip `PUBLIC` link fix — and leave
+  `WebAudioAudioPlayer` for Milestone 4. Fork ZAPDTR from `ee3397a` (which is *already* this
+  tree's pin — the SoH wasm fork branches from the same commit and adds 21 lines across 3
+  files).
+- Add an `EMSCRIPTEN` arm to the platform chains in `CMakeLists.txt` and `mm/CMakeLists.txt`.
+- `CMake/emscripten-deps.cmake`, copied from the SoH branch.
+- Emscripten ports on both the compile *and* link line: `--use-port=sdl2 --use-port=ogg
+  --use-port=vorbis --use-port=zlib`. Mixing a port header with a host library is a
+  silent-corruption bug.
+- `-fwasm-exceptions` + `-sWASM_LEGACY_EXCEPTIONS=1`, `FMT_CONSTEVAL=constexpr`,
+  `GFX_DEBUG_DISASSEMBLER OFF`, `SPDLOG_MIN_CUTOFF` default of info.
+- Exclude the host tools: ZAPD and OTRExporter subdirectories, the `ZAPDLib` link
+  (`mm/CMakeLists.txt:538-540`, `:608`), the `ExtractAssets` / `Generate2ShipOtr` custom
+  targets, and `mm/2s2h/Extractor/` sources (the existing filter at `:114` targets `ship__`;
+  confirm the glob the sources actually arrive through).
+- Stub Opus in `mm/2s2h/mixer.c`.
+- `INITIAL_MEMORY` 512 MB, `ALLOW_MEMORY_GROWTH`, `STACK_SIZE` 4 MB, `EXIT_RUNTIME=0`.
+
+**Exit criterion:** `2ship.js` + `2ship.wasm` link. Expect the source edits to be small —
+SoH's decomp translated to wasm without a single source change, and everything else was
+build plumbing.
+
+### Milestone 2 — single-threaded shims
+
+- Compile out the body of `OTRGlobals::RunExtract` (`mm/2s2h/BenPort.cpp:275`). Beyond the
+  ZAPD dependency, its `while (!extractDone)` frame-pump would hang the tab outright: it
+  draws `BenGui` popups in a loop that never returns to the event loop, so the click to
+  dismiss one could never arrive — and it runs *before* `Main()`. Replace it with the
+  archive preflight (below).
+- Guard `Messagebox_ShowErrorBox` (`:954`), which calls `Extractor::ShowErrorBox`, and the
+  unguarded `#include "Extractor/Extract.h"` at `:40`.
+- Split `OTRAudio_Thread`'s body into `OTRAudio_FillBuffer`; call it inline from
+  `Graph_ProcessGfxCommands` (`:1201`) and delete the handshake on that path. Do not start
+  the thread (`:861`); do not join it (`:880`).
+- Synchronous decode in `AudioSampleFactory.cpp:314-322`.
+- `emscripten_set_main_loop` + the tick clock in `graph.c`.
+- Preload `gamecontrollerdb.txt` (a missing file only logs, but the log is noise).
+
+### Milestone 3 — boots to an ImGui frame
+
+Before touching the game, stand up SDL + WebGL2 + ImGui alone via
+`Fast3dWindow::RunGuiOnly()`. This isolates the window/render/GUI stack from both the game
+loop and the archives, so a Milestone 4 failure has one cause instead of three.
+`OTRGlobals`' constructor (`mm/2s2h/BenPort.cpp:146-178`) is the seam: resource manager with
+`2ship.o2r` only, then window, then GUI — everything after is game.
+
+Force `ImGuiConfigFlags_ViewportsEnable` off: it needs real OS windows.
+
+Delete this path once Milestone 4 lands; it will rot otherwise.
+
+### Milestone 4 — boots to title, with sound
+
+- Pre-mount `2ship.o2r` (via `--preload-file`, `SHELL:`-wrapped) and accept `mm.o2r` from the
+  host.
+- The archive preflight that replaces `RunExtract`: refuse to start on a port archive from
+  another build or a game archive from an incompatible version, and report *why* through the
+  embedder bridge. Without it, a missing or stale `mm.o2r` fails at the first resource load,
+  in a loop that never returns to the page and that no event reports.
+- Land `WebAudioAudioPlayer` in the LUS fork and make it the browser default, SDL the
+  fallback.
+- Deepen the audio target; keep the `static_assert` that ties it to the player's drop
+  threshold.
+- Measure a Release build. SoH's came to 24.7 MB raw / **4.2 MB brotli**, which settled the
+  question of whether any splitting or streaming strategy was needed (it was not). Expect a
+  similar order here; measure before deciding anything.
+
+**Exit criterion:** boots past the title into an attract demo, textured geometry, verified by
+screenshot rather than inference — an early flat-gradient frame is a transition fade, not
+proof of rendering.
+
+### Milestone 5 — playable
+
+- Keyboard input, save persistence, mod layer.
+- **Storage belongs to the host page, not the module.** SoH's second pass replaced an IDBFS
+  design with `Module.shipFiles` — the page writes bytes into MEMFS during `preRun` and
+  receives `file-saved` / `file-removed` events back. That removes the write-behind
+  `syncfs()` problem entirely, keeps the module storage-agnostic, and means the published
+  artifact contains nothing extracted from a ROM. Do the same; do not rebuild IDBFS.
+- `EmbedderBridge`, retargeted to MM's vocabulary, plus `…_RunConsoleCommand` and
+  `…_GetStats`.
+- `host.html`, `EMBEDDING.md`, `HOST-API.md`.
+- The bun + Playwright suite: boot, audio, timing, soak, artifacts (which asserts the
+  Binaryen locals cap), host-api.
+- Runtime CVar defaults rather than deletions for anything that misbehaves:
+  `MultiViewports=0`, MSAA 1, one frame per tick.
+
+### Milestone 6 — ROM → o2r in the browser
+
+`2ship-extract.{js,wasm}`: ZAPD + OTRExporter + the pure ROM checks as a separate module the
+host runs in a worker. Modelled on SoH's `soh/wasm/extract/`, which lists the ZAPD and
+OTRExporter sources explicitly rather than using their own CMakeLists (ZAPD's adds `-pthread`
+on every non-Darwin target and requires a libpng package a cross build cannot find).
+
+Cheaper here than it was there: this tree ships **2** extraction configs
+(`mm/assets/extractor/Config_GC_US.xml`, `Config_N64_US.xml`) against SoH's 14, so the
+embedded recipe set is far smaller.
+
+## What not to strip
+
+Stripping the GUI and enhancements is tempting and is the wrong call:
+
+- **316 files** under `mm/` call `CVarGet*`. Enhancements are wired in through GameInteractor
+  hooks and `ShipInit`, not isolated behind a flag. Removing them produces link errors and
+  dead branches across the tree — strictly more work than leaving them compiled.
+- ImGui is the **only** debugging surface in a browser tab, where no native debugger can
+  attach. The console commands are worth more here than on desktop, not less.
+
+If something in that layer blocks boot, disable it **at runtime via CVar defaults** —
+reversible, no deletion. The amputations in Milestone 1 are a different axis: they target OS
+services that do not exist in a browser, not UI surface area.
+
+## Effort
+
+Assuming the milestone order above:
+
+| | |
+|---|---|
+| M0 toolchain + baseline | 0.5 day |
+| M1 CMake, amputations, Opus stub | 1–2 days |
+| M1 libultraship rebase (incl. Web Audio) | **3–5 days — the real risk** |
+| M2 frame loop, audio, thread shims | 1 day (near-copy) |
+| M3 GUI-only boot | 0.5 day |
+| M4 archives, title, audio tuning | 1–2 days |
+| M4/M5 framebuffer + depth WebGL2 fixes | **2–4 days — genuinely unknown** |
+| M5 EmbedderBridge, host.html, docs | 2–3 days |
+| M5 test suite port | 1–2 days |
+| M6 extractor module | 2–3 days |
+
+**2–3 weeks to a playable browser build**, against what was a couple of months of discovery
+on the SoH side.
+
+## Do this first
+
+Before committing to the schedule, spike **the libultraship rebase alone**: branch a fork
+from `7f9b86a5`, apply the wasm patch, and see how much of `WebAudioAudioPlayer` survives the
+rewritten `AudioPlayer` interface. It is the only item whose cost is not already known, and
+everything downstream depends on it. If that lands cleanly, the rest is largely mechanical.
+
+## Open questions
+
+- How much of the LUS audio patch survives the 80-commit gap. (See above.)
+- Whether MM's framebuffer effects can be made to work on WebGL2, or need a CVar to disable.
+- Whether the synchronous ResourceManager executor is fast enough at scene load, or visibly
+  hitches. Unanswered on the SoH side too — the logging confound was removed but the question
+  was never retested.
+- Memory ceiling. wasm32 caps at 4 GB and `-sMAXIMUM_MEMORY=4GB` works in current desktop
+  browsers, but Safari and iOS are tighter. Measure this tree's desktop RSS before committing.
+- Performance. MM is a heavier game than OoT; entirely untested here.
+- Is `-fwasm-exceptions` acceptable for the target browsers?
