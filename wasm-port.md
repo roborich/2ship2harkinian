@@ -13,10 +13,12 @@ what is genuinely new here.
 
 ## Status (2026-09-21)
 
-**Milestones 0-4 are done.** The game boots in a browser, renders Termina/Clock Town
-correctly, runs at the right speed, plays audio and responds to the console. Milestone 3 (a
-GUI-only boot) was skipped: the full game rendered on the first attempt, so there was nothing
-to isolate.
+**Milestones 0-4 are done, bar the audio player.** The game boots in a browser, renders
+Termina/Clock Town correctly, runs at the right speed, plays audio and responds to the console.
+Milestone 3 (a GUI-only boot) was skipped: the full game rendered on the first attempt, so
+there was nothing to isolate. Milestone 4 was marked complete on the strength of "plays audio",
+which it does — through SDL, on the page's main thread. The player it was supposed to land is
+§"Milestone 4b".
 
 | | |
 |---|---|
@@ -24,7 +26,7 @@ to isolate.
 | `2ship.js` / `2ship.data` | 0.4 MB / 1.8 MB |
 | Tick rate | 60/`R_UPDATE_RATE` Hz, within 5%, one frame drawn per tick |
 | Heap | 512 MB at the initial size, no growth observed over ~2 minutes |
-| Tests | 37, passing (`mm/wasm/tests`) |
+| Tests | 37, passing (`mm/wasm/tests`) — two of them vacuously; see below |
 
 3.5 MB over the wire is an ordinary web download, so **size is not a constraint** and no
 splitting or streaming strategy is needed — the same conclusion the SoH port reached.
@@ -78,8 +80,43 @@ static.
 
 **Still open: why the clear was oversized.** 21,600 bytes is `numSamplesToLoadAdj ≈ 10784`
 where a sane value is a few hundred, on the branch that handles the port's own streamed-audio
-codecs. The window now bounds the damage, but that number is still wrong, and the Opus stub
-(§"Ports nearly verbatim") is a suspect worth eliminating first.
+codecs. The window now bounds the damage, but that number is still wrong.
+
+*Narrowed 2026-09-21.* The size cannot come from a note's tuning, which was the first
+suspicion. `numSamplesToLoad = (frequencyFixedPoint * numSamplesPerUpdate * 2 +
+samplePosFrac) >> 16` (`mm/src/audio/lib/synthesis.c:964-966`), and two hard bounds apply:
+
+- `frequencyFixedPoint` is a **`u16`** (`mm/include/z64audio.h:435`), and
+  `AudioPlayback_NoteSetResamplingRate` (`mm/src/audio/lib/playback.c:125-145`) clamps every
+  sample that is not a synthetic wave to `1.99998` before the conversion. `CODEC_S16` takes
+  the non-synthetic path, so the ratio is capped at ~2.0 whatever tuning the sample carries —
+  a streamed 48 kHz file does not get to ask for 30×.
+- `numSamplesPerUpdate` is structurally small: `updatesPerFrame = (target + 0x10) / 0xD0 + 1`
+  (`mm/src/audio/lib/heap.c:956`), so the per-update count lands near 208 regardless of the
+  sampling frequency. With `refreshRate = 60` at 32 kHz it is 176/184/168, and the
+  final-update remainder is 192.
+
+So a healthy clear is at most `(≈400 + 16) * 2` ≈ **832 bytes**, and 10,784 samples requires
+either `numSamplesPerUpdate ≈ 5392` — which nothing in that derivation can produce — or a
+**negative** `numSamplesPerUpdate` wrapping through the `u32 numSamplesToLoadFixedPoint` at
+`synthesis.c:904`.
+
+A second tell points the same way: `codec` is a **4-bit field** (`mm/include/audio/soundfont.h:51`)
+and vanilla MM samples are `CODEC_ADPCM` (0) or `CODEC_SMALL_ADPCM` (3). Reaching the
+`CODEC_S16` / `CODEC_OPUS` arm at all on a stock boot with no custom audio means the `Sample`
+the note pointed at was already garbage. The Opus stub is therefore *not* the suspect it
+looked like: it is downstream of the same bad pointer.
+
+Which reframes the whole thing — **the oversized clear is a symptom, not the origin.** Widening
+the window contained the blast radius, which is why the crashes stopped, but the first write is
+still unexplained and may still be happening harmlessly inside the 128 KB buffer.
+
+Next step, cheaper than more theorising: at `synthesis.c:1151`, when
+`numSamplesToLoadAdj > 2 * numSamplesPerUpdate`, log `numSamplesPerUpdate`,
+`frequencyFixedPoint`, `sample->codec`, `sample` and `noteIndex` once and run the ASan recipe
+below. Do it on **desktop as well**, with the same `mm.o2r` — if it reproduces there, this
+leaves the wasm port's scope entirely and becomes a 2Ship bug report, the same way the config
+use-after-free did.
 
 Two guards remain in `mm/src/audio/sfx.c` as canaries — a bound on the bank walk and a refusal
 to unlink the list sentinel. The failure they catch is silent and total, and they cost one
@@ -112,11 +149,84 @@ one run report the whole list rather than one item per relink; it also turns off
 `detect_container_overflow`, which the FetchContent dependencies trip as a known false
 positive. Reach for this before theorising about a memory fault again.
 
+### Found by comparing against the finished SoH branch — 2026-09-21
+
+The SoH port was written up in `~/code/soh-wasm-port-notes.md` and its branch re-read against
+this one, commit by commit. The headline is that the expensive things are already right: the
+frame loop and tick clock, one draw per tick, the whole build-flag table including both halves
+of the V8/TurboFan pair, the `-pthread` exclusion, the `SubmitTask` seam, the synchronous
+logger, and the compile-time spdlog cutoff are at parity or verbatim-identical. Five of the
+eight LUS wasm commits are here already. **The entire LUS-side gap is audio.**
+
+Four things did come out of it, none of them in the frame loop.
+
+**1. The pause screen does a synchronous GPU→CPU readback.** This document previously claimed
+(§"Resolved along the way") that `ReadFramebufferToCPU` is never reached. That is wrong for MM.
+The chain is live: `mm/src/code/z_play.c:1520` (the pause background prerender) →
+`FB_WriteFramebufferSliceToCPU` (`mm/2s2h/framebuffer_effects.c:114`) → `gDPReadFB` →
+`gfx_read_fb_handler_custom` (`libultraship/src/fast/interpreter.cpp:4183-4184`), which does a
+`gfx->Flush()` and then `ReadFramebufferToCPU` — a blocking
+`glReadPixels(0, 0, 320, 240, GL_RGBA, GL_UNSIGNED_BYTE)` of 307 KB plus a 76,800-iteration
+conversion loop (`libultraship/src/fast/backends/gfx_opengl.cpp:1000-1023`). A full pipeline
+flush and a readback stall, inside the frame callback, on a routine player action. Two more
+live sites in `mm/src/overlays/actors/ovl_En_Arrow/z_en_arrow.c:723` and `:748`.
+
+**In SoH this function has no callers** — only a declaration and a definition. So that port
+never paid the cost, which is why its notes do not mention it and why the assumption carried
+over here untested. Its notes also say this path uses `GL_UNSIGNED_SHORT_5_5_5_1`, "which
+WebGL2 `readPixels` forbids"; that is stale. Our LUS already reads RGBA8 and converts, so it is
+spec-legal — which is precisely *why* it runs rather than failing. The problem is the
+synchronisation, not the format.
+
+**2. `GetPixelDepth` queues per-coordinate blits and then reads nothing.** In
+`libultraship/src/fast/backends/gfx_opengl.cpp:1026-1090`, both
+`glReadPixels(… GL_DEPTH_STENCIL …)` calls sit behind `#ifndef USE_OPENGLES`, which this build
+now sets. The single-coordinate branch declares `uint32_t depth_stencil_value` at `:1035`,
+never writes it, and feeds it to `res.emplace(…, (depth_stencil_value >> 18) << 2)`. The
+multi-coordinate branch still runs one `glBlitFramebuffer` **per coordinate per frame**
+(`:1063-1074`) and then reads nothing at all. MM drives this harder than OoT:
+`mm/src/code/z_lights.c:411` once per `LIGHT_POINT_GLOW` light per frame, plus
+`mm/src/code/z_kankyo.c:532` and `mm/src/code/sys_cfb.c:133`.
+
+**3. Interpolation still builds its recording tree every frame.** `target_fps` is correctly
+forced (`mm/2s2h/BenPort.cpp:1365`), so no extra frames are *drawn* — but
+`FrameInterpolation_StartRecord`
+(`mm/2s2h/Enhancements/FrameInterpolation/FrameInterpolation.cpp:468-470`) sets
+`is_recording = true` whenever `GetInterpolationFPS() != 20`, independently of that. The whole
+matrix and gfx-op recording tree then gets built every frame for data nothing consumes, and
+`mm/src/code/z_kankyo.c:3394` switches the skybox stars onto the slower projection-matrix path.
+Reachable two ways in a browser: the unguarded slider at `mm/2s2h/BenGui/BenMenu.cpp:623-652`,
+or an embedder handing over a desktop config — which is the *documented* workflow
+(`mm/wasm/HOST-API.md`).
+
+**4. A desktop config silences the build, and two tests hide it.** `Audio::GetSavedAudioBackend`
+(`libultraship/src/ship/audio/Audio.cpp:69-84`) returns `WASAPI` or `COREAUDIO` from the config
+string on any platform. Under Emscripten neither `case` exists in `InitAudioPlayer` (`:17-35`),
+so it falls to `default:` → `NullAudioPlayer` — silent, with no diagnostic — and
+`SetCurrentAudioBackend` writes the bad value straight back. SoH fixed this in LUS `30d0cf54`
+by resolving an absent backend against `mAvailableAudioBackends`. Separately,
+`mm/2s2h/BenGui/Menu.cpp:316` passes the full `audioBackendsMap`, so the browser build offers
+*Windows Audio Session API* and *CoreAudio* in the dropdown; SoH's `f3d5e096c` filters it
+through `GetAvailableAudioBackends()`.
+
+Two tests are green over this and should not be:
+
+- `mm/wasm/tests/smoke.test.ts:26` boots `staleDesktopConfig()` — which sets
+  `AudioBackend: "coreaudio"` (`mm/wasm/tests/lib/configs.ts:26-31`) — and only asserts that a
+  picture appears. It never checks that anything is audible.
+- `mm/wasm/tests/timing.test.ts:32` sets `config.CVars.gSettings.InterpolationFPS = 60`. That is
+  SoH's CVar path (`CVAR_SETTING("InterpolationFPS")`). This tree has no `CVAR_SETTING` macro:
+  the CVar is the flat `gInterpolationFPS` (`mm/2s2h/BenPort.cpp:867`,
+  `mm/2s2h/BenGui/BenMenu.cpp:624`). The test writes a key nothing reads, interpolation stays at
+  20, and `drawsPerTick ≈ 1` passes for free — so the one-draw-per-tick guarantee is untested.
+
 ### Not started
 
 Milestone 5 (storage, mods, keyboard polish), Milestone 6 (the ROM converter), the Web Audio
 player, and depth readback. The build plays through SDL's Emscripten audio backend, whose
-callback runs on the page's main thread, so any long frame is audible.
+callback runs on the page's main thread, so any long frame is audible — and the deep queue
+already configured (`WASM_AUDIO_DESIRED_BUFFERED 4320`, `mm/2s2h/BenPort.cpp:155`) is currently
+135 ms of latency buying nothing, because the code that drains it is the thing being starved.
 
 ## Scope for the first pass
 
@@ -284,18 +394,27 @@ its source directory absent from the tree. That is three of SoH's shims gone.
    and a `warp` console command that resolves age and time of day. MM needs its own vocabulary
    — day of the three-day cycle, not age.
 
-4. **Depth readback — the only real WebGL2 gap.**
-   *(Revised 2026-09-21 after review.)* An earlier draft claimed MM's framebuffer effects
-   would hit two WebGL2 gaps harder than OoT. Checked, and that is wrong on both counts:
+4. **Depth readback, and a framebuffer readback that is worse than depth.**
+   *(Revised 2026-09-21 after review. Revised again the same day: the second bullet below was
+   wrong, and wrong in a way worth recording.)*
 
    - `ReadFramebufferToCPU`'s `GL_UNSIGNED_SHORT_5_5_5_1` readback **is already fixed
-     upstream** at `7f9b86a5` (it reads RGBA/UNSIGNED_BYTE and converts on the CPU) — and
-     2Ship never issues it anyway: there is no `gsSPReadFB` / `G_READFB` anywhere in
-     `mm/src` or `mm/2s2h`.
-   - Every MM framebuffer effect (`FB_CopyToFramebuffer` / `FB_DrawFromFramebuffer` in
-     `z_play.c` and `z_visfbuf.c`, and all of `framebuffer_effects.c`) goes through
-     `OTR_G_COPYFB` → `CopyFramebuffer` → `glBlitFramebuffer`, which WebGL2 has. Nothing
-     here is MM-specific or harder than OoT.
+     upstream** at `7f9b86a5`: it reads RGBA/UNSIGNED_BYTE and converts on the CPU
+     (`libultraship/src/fast/backends/gfx_opengl.cpp:1000-1023`), so it is spec-legal under
+     WebGL2.
+   - ~~2Ship never issues it anyway: there is no `gsSPReadFB` / `G_READFB` anywhere in
+     `mm/src` or `mm/2s2h`.~~ **False.** The macro is spelled **`gDPReadFB`**, and grepping
+     for the other two names found nothing while three live call sites sat in the tree:
+     `mm/2s2h/framebuffer_effects.c:114` (reached from `mm/src/code/z_play.c:1520`, the pause
+     background prerender) and `mm/src/overlays/actors/ovl_En_Arrow/z_en_arrow.c:723` / `:748`.
+     Being spec-legal is what makes this bite: the readback *runs*, synchronously, with a
+     pipeline flush in front of it, every time the player pauses. See §"Found by comparing
+     against the finished SoH branch", item 1. A negative grep is not evidence unless the
+     spelling was checked against the header first.
+   - The *other* MM framebuffer effects (`FB_CopyToFramebuffer` / `FB_DrawFromFramebuffer` in
+     `z_play.c` and `z_visfbuf.c`, and the rest of `framebuffer_effects.c`) do go through
+     `OTR_G_COPYFB` → `CopyFramebuffer` → `glBlitFramebuffer`, which WebGL2 has. That part of
+     the earlier revision holds.
 
    What is left is depth readback, compiled out under `USE_OPENGLES` because WebGL2
    `readPixels` cannot read `GL_DEPTH_STENCIL`, leaving `depth_stencil_value` uninitialized.
@@ -498,7 +617,7 @@ Force `ImGuiConfigFlags_ViewportsEnable` off: it needs real OS windows.
 
 Delete this path once Milestone 4 lands; it will rot otherwise.
 
-### Milestone 4 — boots to title, with sound ✅ DONE
+### Milestone 4 — boots to title, with sound ✅ DONE, minus the player
 
 - Pre-mount `2ship.o2r` (via `--preload-file`, `SHELL:`-wrapped) and accept `mm.o2r` from the
   host.
@@ -506,10 +625,12 @@ Delete this path once Milestone 4 lands; it will rot otherwise.
   another build or a game archive from an incompatible version, and report *why* through the
   embedder bridge. Without it, a missing or stale `mm.o2r` fails at the first resource load,
   in a loop that never returns to the page and that no event reports.
-- Land `WebAudioAudioPlayer` in the LUS fork and make it the browser default, SDL the
-  fallback.
+- ❌ Land `WebAudioAudioPlayer` in the LUS fork and make it the browser default, SDL the
+  fallback. **Not done** — the milestone was marked complete on the strength of "plays audio",
+  which it does, through SDL. The plan is now §"Milestone 4b" below.
 - Deepen the audio target; keep the `static_assert` that ties it to the player's drop
-  threshold.
+  threshold. Done (`mm/2s2h/BenPort.cpp:155-158`, `:902-906`) — but see 4b: the depth is only
+  headroom once the consumer is off the main thread.
 - Measure a Release build. SoH's came to 24.7 MB raw / **4.2 MB brotli**, which settled the
   question of whether any splitting or streaming strategy was needed (it was not). Expect a
   similar order here; measure before deciding anything.
@@ -518,6 +639,125 @@ Delete this path once Milestone 4 lands; it will rot otherwise.
 the flow is N64 logo → TitleSetup → `z_opening.c` running `Play_Init`), drawing textured
 Play-state geometry — verified by screenshot rather than inference, since an early
 flat-gradient frame is a transition fade, not proof of rendering.
+
+### Milestone 4b — the Web Audio player
+
+**Why.** Emscripten's SDL2 plays through a `ScriptProcessorNode`, whose `onaudioprocess` is a
+**main-thread event** sized by `SampleLength`. The code that moves samples from SDL's queue to
+the device is therefore the thing a long frame starves, so queue depth is not the lever it
+looks like — any frame over roughly 20–40 ms is audible however much is queued. SoH spent days
+tuning the queue before working this out; do not repeat that. The fix is a new LUS player whose
+consumer runs on the browser's audio rendering thread, at which point the 135 ms target already
+configured here becomes real headroom.
+
+Worse here than in SoH: MM changes `R_UPDATE_RATE` far more often (2 in the pause menu and every
+message box, 1 on title / file select / "Dawn of the Nth Day"), so long frames and rate
+transitions are both more frequent.
+
+**What is already in place.** More than it looks. The game side is done and commented for a
+player that does not exist yet — `WASM_AUDIO_DESIRED_BUFFERED 4320` and
+`WASM_AUDIO_DROP_THRESHOLD 6000` (`mm/2s2h/BenPort.cpp:155-158`), the `static_assert` tying the
+target to the drop threshold (`:902-906`), `Ship_EmbedderCountAudioDrop` and the `audioDrops`
+counter (`mm/2s2h/EmbedderBridge.cpp:207-228`), and the inline `OTRAudio_FillBuffer()` at the
+top of `Graph_ProcessGfxCommands` (`:1348-1353`). So are the diagnostics: `mm/wasm/host.html:76-86`
+already reads `Module.LUSWebAudio`, and `mm/wasm/tests/lib/game.ts:278` already has the
+`webAudio()` accessor and `BootOptions.initScript`. **Nothing on the 2Ship side needs porting
+except a menu label and the availability filter.**
+
+The two LUS forks are also the same generation — same `src/ship/audio/` layout, same
+`SoundMatrixDecoder`, and `AudioPlayer.cpp` / `SDLAudioPlayer.cpp` are byte-identical between
+them. The player drops in unchanged.
+
+**Step 1 — the three new files, verbatim from SoH's LUS** (`f859ced9` plus the review fixes in
+`5eaac696`; take them as one change rather than reproducing the first commit's two bugs):
+
+| File | Size | Note |
+|---|---|---|
+| `libultraship/include/ship/audio/WebAudioAudioPlayer.h` | ~34 lines | Only the `SOH [WASM]` → `2S2H [WASM]` marker changes. |
+| `libultraship/src/ship/audio/WebAudioAudioPlayer.cpp` | ~61 lines | `kRingCapacityFrames = 16384`, `kMaxQueuedFrames = 6000`. |
+| `libultraship/src/ship/audio/WebAudioAudioPlayer.js` | ~291 lines | The `--js-library`. |
+
+The design, for the record: an `AudioWorklet` (processor name `lus-audio`) fed by `postMessage`
+with **transferred** `Int16Array`s copied out via `HEAP16.slice(...)` — no `SharedArrayBuffer`,
+so no COOP/COEP and no constraint on any embedder. The worklet posts back
+`{consumed, dropped, underruns}` every fourth render quantum and immediately on any underrun;
+`Buffered()` is `max(0, queued - consumed - dropped)`. On underrun it fills the quantum with
+silence and **does not advance `readPos`**, so queued audio plays back intact rather than being
+skipped. It resamples with linear interpolation when the browser refuses
+`new AudioContext({sampleRate: 32000})`. Output honours `GetNumOutputChannels()` (2 or 6),
+duplicating the last source channel if the destination is wider — so this tree's 5.1 path is
+covered without extra work.
+
+**Step 2 — LUS wiring. This is where 2Ship diverges from SoH** and the one part that is not a
+copy. SoH's LUS moved the backend-name mapping into `Config.cpp`; ours keeps it in `Audio.cpp`
+behind an `mConfig` member. So:
+
+- `include/ship/audio/Audio.h:12` — insert `WEBAUDIO` **before** `NUL`. (LUS persists the
+  backend as a string, so the insertion point is safe; a CVar storing the index would not be.)
+- `include/ship/audio/AudioPlayer.h` — add `virtual bool HasFailed() { return false; }`,
+  Doxygen-commented to match the file, and the `#ifdef __EMSCRIPTEN__` include at the bottom
+  beside the SDL and Null ones. `~AudioPlayer()` is already `virtual` here, so no destructor
+  work.
+- `src/ship/audio/Audio.cpp`:
+  - `InitAudioPlayer()` — add `case AudioBackend::WEBAUDIO` under `#ifdef __EMSCRIPTEN__`, and
+    on `Init()` failure fall back to SDL rather than `NUL`.
+  - `Init()` — push `WEBAUDIO` **first**, before `SDL`, so it is the browser default; then the
+    `std::find` availability guard from item 4 above. Keep the trailing `SetAudioChannels(...)`.
+    Needs `#include <algorithm>`.
+  - `GetSavedAudioBackend()` — the `"webaudio"` string, and `#ifdef __EMSCRIPTEN__ return
+    AudioBackend::WEBAUDIO;` in the default chain. Keep the `"pulse"` → SDL migration ahead of
+    it.
+  - `SetCurrentAudioBackend()` — `case WEBAUDIO: mConfig->SetString(…, "webaudio")`.
+  - `GetAudioPlayer()` — the `HasFailed()` poll. Every audio entry point in
+    `src/libultraship/bridge/audiobridge.cpp` funnels through it, so the once-per-frame
+    `AudioPlayer_Buffered()` *is* the poll; no extra plumbing.
+  - New `FallBackToSdl(const char* why)` — sets `mAudioBackend` and calls `InitAudioPlayer()`
+    **directly**. This matters more here than in SoH, because our `SetCurrentAudioBackend`
+    calls `mConfig->Save()` unconditionally (`Audio.cpp:126`): routing the fallback through it
+    would persist `"sdl"` and pin every future session to the main-thread player over one
+    session's CSP failure.
+- `src/ship/CMakeLists.txt` — an `if (EMSCRIPTEN)` block passing the `--js-library` via
+  `target_link_options(libultraship PUBLIC "SHELL:…")` plus an `INTERFACE_LINK_DEPENDS` so
+  editing the JS relinks, with `else()` filtering the files out of the desktop build.
+
+**Step 3 — game side.** Two small things: `{ Ship::AudioBackend::WEBAUDIO, "Web Audio" }` in
+`mm/2s2h/BenGui/MenuTypes.h:291`, and the availability filter from item 4 — as an
+`unordered_map` returned by reference and passed as `&AvailableAudioBackendsMap()` to match this
+tree's `Combobox` signature (`mm/2s2h/BenGui/UIWidgets.hpp:673` takes a pointer). **Do these
+together:** adding the enum member is exactly what makes "Web Audio" selectable on desktop,
+where it would play through the null player.
+
+**Step 4 — tests and docs.** Port the four tests from SoH's `soh/wasm/tests/audio.test.ts`
+(a backend this build lacks plays through Web Audio; no underruns on the title screen; a worklet
+rejected via `initScript` falls back to SDL *without* persisting it; SDL still works when the
+config names it), and replace the stale "no Web Audio player yet" header in
+`mm/wasm/tests/audio.test.ts`. Then the `Window.AudioBackend` row in `mm/wasm/EMBEDDING.md`,
+plus a note that **a gamepad button is not a user gesture** — a controller-only session needs
+one touch or click before the context will start.
+
+**Traps, all of which cost SoH a review round:**
+
+- **`--js-library`, not `EM_ASM`.** The macro splits its code block at every comma outside
+  parentheses, which rules out object literals; the JS is full of them, and a file allows
+  comments.
+- **`DoInit()` returning true is not "audio works".** The worklet loads asynchronously
+  afterwards. Without `HasFailed()`, a page whose CSP forbids `blob:` scripts is silent for the
+  whole session with nothing but one `console.error`.
+- **Keep the resume listeners armed for the session.** A context can leave `running` with no
+  `visibilitychange` — an iOS phone call, Siri, a headphone or Bluetooth route change. The
+  250 ms `navigator.userActivation.hasBeenActive` poll is what rescues a controller-only
+  session after a gesture anywhere on the page.
+- **Do not count underruns while the tab is hidden.** A throttled loop starves the worklet by
+  design; counting those makes the metric useless.
+- **Read `HEAP16` at call time, never cache a heap view** — memory growth reassigns it. The
+  processor function must also be hermetic: it is stringified into a blob and evaluated in the
+  worklet's global scope, where only the Web Audio globals exist.
+- **`6000` now lives in three places** — the new player, `SDLAudioPlayer::DoPlay`, and
+  `mm/2s2h/BenPort.cpp:158`. They must stay equal or the `static_assert` guards nothing.
+
+**Exit criterion:** the four ported tests pass, and `Module.LUSWebAudio.underruns` stays at zero
+across a pause, a scene transition and a camera flip — the three things that were audible
+before.
 
 ### Milestone 5 — playable
 
@@ -562,12 +802,20 @@ services that do not exist in a browser, not UI surface area.
 
 ## What is left
 
-Milestones 0-4 are done (see Status). What remains, in the order I would do it:
+Milestones 0-4 are done bar the audio player (see Status, and Milestone 4b). What remains, in
+the order I would do it — the first four rows are small, and every one of them is currently
+masked by a test that passes:
 
 | | | |
 |---|---|---|
-| **Why the DMEM clear was oversized** | 0.5–1 day | `numSamplesToLoadAdj ≈ 10784` on the streamed-codec branch, where a sane value is a few hundred. The window now bounds the damage but the number is still wrong. Eliminate the Opus stub as a suspect first. |
-| **Web Audio player** | 1–2 days | SDL's Emscripten backend runs its callback on the page's main thread, so any long frame is audible whatever the queue depth. The LUS player exists on the SoH side; port it with the `AudioBackend` enum, the `audioBackendsMap` entry (`BenGui/MenuTypes.h:291`) and the fallback guard. |
+| **Audio backend availability guard + menu filter** | ~15 lines | Port LUS `30d0cf54` and SoH's `f3d5e096c`. A config naming `coreaudio` silences the build through `NullAudioPlayer` with no diagnostic. Do this first: otherwise it is a false lead the moment anyone touches audio. Add `audioDrains(...)` to `mm/wasm/tests/smoke.test.ts:26`, which covers this case today and never listens. |
+| **Force `GetInterpolationFPS()` to 20 under Emscripten** | ~1 hour | `mm/2s2h/BenPort.cpp:861-870`. Closes the `is_recording` path for a host-supplied desktop config, not just the UI — better than SoH's UI-only guard — and lets `:1365` drop its `#ifdef`. Guard the three widgets at `mm/2s2h/BenGui/BenMenu.cpp:623-652` too, so they are not inoperative controls. |
+| **Early-return `OTRGetPixelDepth*` under Emscripten** | ~1 hour | `mm/2s2h/BenPort.cpp:1443-1464`. Removes one `glBlitFramebuffer` per glow coordinate per frame that nothing reads, and the uninitialised `depth_stencil_value` read, in one place without touching LUS. Sun/glow occlusion becomes consistently on or off instead of flickering off garbage — an improvement on today. |
+| **Fix the vacuous timing test** | minutes | `mm/wasm/tests/timing.test.ts:32` → `config.CVars.gInterpolationFPS = 60`. Until then the one-draw-per-tick guarantee is untested. |
+| **Web Audio player** | 1–2 days | See Milestone 4b for the full plan. Also the cheapest mitigation for the pause-screen readback stall, which becomes survivable rather than audible. |
+| **Why the DMEM clear was oversized** | 0.5–1 day | `numSamplesToLoadAdj ≈ 10784` where the arithmetic caps a healthy value near 400. Narrowed: it cannot come from tuning, so the note's `Sample` was already corrupt — the clear is a symptom. Instrument `synthesis.c:1151` and run it on desktop as well as wasm; see "The audio overrun". |
+| **The pause-screen framebuffer readback** | 1–2 days, or 0 | `z_play.c:1520` → a synchronous 307 KB `glReadPixels` plus a 76,800-iteration conversion, with a pipeline flush in front, every time the player pauses. SoH never reached this code. Land Web Audio first and measure: if the stall is not visible, a PBO + async readback is not worth the frame of staleness. |
+| **`-fsanitize=function` sweep** | 0.5 day | Two signature mismatches were found, but both by wasm-ld — which only sees *direct* calls. Mismatches through function-pointer slots trap at runtime, and M5 exercises far more of the tree. Enumerate them on a native build before chasing one in a browser. |
 | **Storage (M5)** | 1–2 days | Enumerate 2Ship's write paths — `SaveManager` (~30 sites, its own `saves/`), `BinarySaveConverter`, three TimeSplits trackers, `DeveloperTools`, `DeleteFileOnDeath`, `Rando/StartingItems`, `Rando/ExcludedChecks`, `Rando/Spoiler/File`, `PresetManager` — against the bridge's watch list, which currently covers the config and `saves/` only. `NewFileSetup.cpp:126` parses a spoiler file through an unguarded `json::parse`. |
 | **Mods (M5)** | 1 day | `ModMenu.cpp` scans a mods directory; SoH needed a rewrite of its equivalent to tolerate a config listing mods absent from MEMFS. Untested here. |
 | **Depth readback** | 1–2 days | Compiled out under `USE_OPENGLES` because WebGL2 `readPixels` cannot read `GL_DEPTH_STENCIL`, leaving `depth_stencil_value` uninitialized. Consumers: `z_kankyo.c:532` (sun occlusion), `z_lights.c:411` (glow). Needs a depth-to-color path or a CVar. |
@@ -577,8 +825,9 @@ Milestones 0-4 are done (see Status). What remains, in the order I would do it:
 | **M6: ROM -> o2r converter** | 2–3 days | `2ship-extract.js`, modelled on SoH's `soh/wasm/extract/`. Cheaper here: 2 extraction configs against SoH's 14. |
 
 Roughly **2 weeks** to a build that is playable, persists what it should, and converts its
-own ROM — with the first two rows being what stands between "renders correctly" and
-"playable".
+own ROM. The first four rows are a day between them and remove three sources of per-frame work
+plus one false lead; the Web Audio player is what stands between "renders correctly" and
+"sounds right".
 
 ### Resolved along the way
 
@@ -590,8 +839,11 @@ Things earlier drafts flagged as risks, recorded so they are not re-litigated:
   `default.shader.glsl` between the pins, and an earlier draft called re-validating it under
   WebGL2 "the real unknown". It needed nothing: `USE_OPENGLES ON` plus
   `IMGUI_IMPL_OPENGL_ES3` was sufficient and the game rendered correctly on the first boot.
-- **MM's framebuffer effects** — not harder than OoT's; everything goes through
-  `glBlitFramebuffer`, which WebGL2 has, and `ReadFramebufferToCPU` is never reached.
+- **MM's framebuffer *blits*** — not harder than OoT's; `FB_CopyToFramebuffer` and friends go
+  through `glBlitFramebuffer`, which WebGL2 has. (This entry used to end "and
+  `ReadFramebufferToCPU` is never reached", which was wrong — see §"Needs real work" item 4.
+  The readback is reached, three times, and it is the most expensive thing in the port after
+  audio.)
 - **The V8 tier-up crash** that cost the SoH port a session — the Binaryen inlining cap
   carried over and works; `artifacts.test.ts` and an eager-tier-up run both pass.
 - **The audio handshake** — I diagnosed the crash as the single-threaded integration needing
@@ -599,9 +851,13 @@ Things earlier drafts flagged as risks, recorded so they are not re-litigated:
 
 ## Open questions
 
-- Why `AudioSynth_ProcessSample` asked to clear 21,600 bytes of DMEM. The window now bounds
-  it, but the size is still wrong; see "The audio overrun".
-- Whether depth readback needs a depth-to-color path or just a CVar.
+- What corrupted the note's `Sample` before `AudioSynth_ProcessSample` asked to clear 21,600
+  bytes of DMEM. Narrowed 2026-09-21: the size cannot come from tuning, so the clear is a
+  symptom and the first write is still unaccounted for. See "The audio overrun".
+- Whether depth readback needs a depth-to-color path or just a CVar. (Until then, stop paying
+  for the blits — see "What is left".)
+- Whether the pause-screen `glReadPixels` stall is visible once the audio consumer is off the
+  main thread, or only audible today. Measure before building an async readback path.
 - Whether the synchronous ResourceManager executor is fast enough at scene load, or visibly
   hitches. Unanswered on the SoH side too. Termina Field is the load to measure.
 - Memory ceiling. The build sits at its 512 MB initial size with no growth over a few
@@ -611,5 +867,6 @@ Things earlier drafts flagged as risks, recorded so they are not re-litigated:
   measurements so far only establish that the loop keeps its rate, not that it has headroom.
 - Is `-fwasm-exceptions` acceptable for the target browsers?
 
-Answered since the first draft: the shader rewrite (no work needed), MM's framebuffer effects
-(no work needed), and the libultraship rebase (~1 day). See "Resolved along the way".
+Answered since the first draft: the shader rewrite (no work needed), MM's framebuffer *blits*
+(no work needed — but not the readback, which was mis-cleared and does need work), and the
+libultraship rebase (~1 day). See "Resolved along the way".
