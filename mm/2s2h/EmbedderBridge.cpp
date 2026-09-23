@@ -222,12 +222,16 @@ void Ship_EmbedderCountAudioDrop(void) {
 // vsync divisor; sceneId is -1 outside a play state. interpolationFps is what the frame
 // interpolator asks for, and 20 means it is switched off -- this build always reports 20, so a
 // host-supplied config cannot turn the recording work back on.
+// synthOversized counts synthesis loads larger than a note can legitimately ask for; see
+// gWasmSynthOversizedLoads in mm/src/audio/lib/synthesis.c. Zero on a healthy build.
+extern "C" uint32_t gWasmSynthOversizedLoads;
+
 extern "C" EMSCRIPTEN_KEEPALIVE const char* Ship_GetStats(void) {
     static std::string json;
     json = fmt::format(
-        R"({{"ticks":{},"draws":{},"updateRate":{},"audioBuffered":{},"audioDrops":{},"sceneId":{},"interpolationFps":{}}})",
+        R"({{"ticks":{},"draws":{},"updateRate":{},"audioBuffered":{},"audioDrops":{},"sceneId":{},"interpolationFps":{},"synthOversized":{}}})",
         sTicks, sDraws, R_UPDATE_RATE, AudioPlayer_Buffered(), sAudioDrops,
-        gPlayState != nullptr ? gPlayState->sceneId : -1, Ship_GetInterpolationFPS());
+        gPlayState != nullptr ? gPlayState->sceneId : -1, Ship_GetInterpolationFPS(), gWasmSynthOversizedLoads);
     return json.c_str();
 }
 

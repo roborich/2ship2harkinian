@@ -80,7 +80,7 @@ For tests and profiling, not for building on: the fields can change without noti
 
 ```js
 JSON.parse(Module.ccall('Ship_GetStats', 'string'));
-// { ticks, draws, updateRate, audioBuffered, audioDrops, interpolationFps, sceneId }
+// { ticks, draws, updateRate, audioBuffered, audioDrops, interpolationFps, sceneId, synthOversized }
 ```
 
 `ticks` counts frame-loop callbacks and `draws` the frames drawn in them; this build pins one
@@ -90,7 +90,8 @@ title, file select, opening and "Dawn of the Nth Day" screens). `audioBuffered` 
 of samples queued for the audio device, and `audioDrops` the updates discarded because that
 queue was already full. `interpolationFps` is the frame interpolator's target; `20` means off,
 and this build always reports 20 whatever the config asks for. `sceneId` is `-1` outside a play
-state.
+state. `synthOversized` counts audio synthesis loads larger than a note can legitimately ask for;
+it is zero on a healthy build and non-zero means the note update path is being skipped again.
 
 ## 5. Converting a ROM
 

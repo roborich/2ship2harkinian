@@ -122,6 +122,41 @@ Two guards remain in `mm/src/audio/sfx.c` as canaries — a bound on the bank wa
 to unlink the list sentinel. The failure they catch is silent and total, and they cost one
 comparison per entry.
 
+**Resolved 2026-09-23: it was never a bad pointer.** `AudioPlayback_ProcessNotes`
+(`mm/src/audio/lib/playback.c:203`) carried an N64 memory-map check, `(uintptr_t)parentLayer <
+0x7FFFFFFF → skip this note`, already compiled out for Wii U. On 64-bit desktop no pointer is
+below that, so it never fired. On wasm32 every pointer is, so it skipped **every note attached to
+a sequence layer**: no envelope, no vibrato, no `AudioPlayback_InitSampleState`, and synthesis
+never saw the note while it was held. A note only became audible when its layer released it,
+starting at one attack step with the decay already forced on — the "melody right, rhythm wrong,
+everything staccato" music the browser build had from the first boot. The same skip meant a
+note's `synthState` was never reset for a new occupant of the slot, so `AudioSynth_ProcessSample`
+ran on the previous note's sample position; a stale position past a shorter sample's end makes
+`numSamplesUntilEnd` negative, and the `skip:` path then issues the oversized clear. So the
+21,600-byte write was downstream of the skipped update, not of a garbage `Sample*` — the
+`CODEC_S16` attribution was wrong.
+
+Measured on the same 60 s of Termina Field before and after guarding the check out under
+`__EMSCRIPTEN__`: synthesis-boundary discontinuities fell from 2.3 % of 528/560-frame boundaries
+to the interior rate, 6× amplitude cliffs from 25 to 1, the per-frame RMS floor rose from 19 to
+500, and note iterations reaching synthesis roughly doubled with the small-ADPCM share (the
+sequenced instruments) going from 2 % to 12 %. Tick rate, drops and the player were unchanged
+and were never the problem. The scripts are the PCM tap and analysis under the session
+scratchpad (`audio-capture/capture.ts`, `analyse.py`, `boundaries.py`, `holes.py`); the tap
+wraps the global `AudioWorkletNode` from a test `initScript`, so it needs no rebuild.
+
+What stays: a counter of oversized loads, `synthOversized` in `Ship_GetStats`
+(`gWasmSynthOversizedLoads`, `synthesis.c`), which the audio tests hold at zero; the widened
+DMEM window; and the two `sfx.c` canaries.
+
+Found on the way, **desktop-only, not fixed here**: `aMixImplSSE2` in `mm/2s2h/mixer.c:730-733`
+does `outx7fffLoVec = _mm_unpacklo_epi16(outx7fffLoVec, outx7fffHiVec)` and then reads the
+overwritten `outx7fffLoVec` in the `_mm_unpackhi_epi16` on the next line, and the same for
+`inxGainLoVec`/`inxGainHiVec`, so samples 4-7 of every 8-sample block get the wrong mix on
+x86-64 Windows and Linux builds. It is in `develop`, never runs on wasm (no `-msimd128`) or on
+arm64 Macs (NEON), and `aMixImplRef` and `aMixImplNEON` are correct. The `#if 0` AVX2 copy has the
+same bug. Report upstream with a unit test comparing the three implementations on random input.
+
 ### Also fixed: a use-after-free in the config migration
 
 From the same ASan run. `Ben::ConfigVersion1Updater::Update` bound `const auto&` to a
@@ -817,7 +852,7 @@ masked by a test that passes:
 | ~~**Early-return `OTRGetPixelDepth*` under Emscripten**~~ | done | Landed. Removes a `glBlitFramebuffer` per coordinate per frame that nothing reads, the uninitialised single-coordinate read, and a `glDisable(GL_SCISSOR_TEST)` that `gfx_opengl.cpp` never re-enabled. Returns the game's own no-depth sentinel, so the sun flare, the point glows and the two Invadepoh UFO flares now draw — they previously never drew, because the batched readback was zero-filled. **Needs an eyeball**: they also draw through geometry that should hide them. |
 | **Fix the vacuous timing test** | minutes | `mm/wasm/tests/timing.test.ts:32` → `config.CVars.gInterpolationFPS = 60`. Until then the one-draw-per-tick guarantee is untested. |
 | **Web Audio player** | 1–2 days | See Milestone 4b for the full plan. Also the cheapest mitigation for the pause-screen readback stall, which becomes survivable rather than audible. |
-| **Why the DMEM clear was oversized** | 0.5–1 day | `numSamplesToLoadAdj ≈ 10784` where the arithmetic caps a healthy value near 400. Narrowed: it cannot come from tuning, so the note's `Sample` was already corrupt — the clear is a symptom. Instrument `synthesis.c:1151` and run it on desktop as well as wasm; see "The audio overrun". |
+| ~~**Why the DMEM clear was oversized**~~ | done | Not corruption: `playback.c:203` skipped every layered note on wasm32, which was also why the music was wrong. See "The audio overrun", *Resolved 2026-09-23*. |
 | **The pause-screen framebuffer readback** | 1–2 days, or 0 | `z_play.c:1520` → a synchronous 307 KB `glReadPixels` plus a 76,800-iteration conversion, with a pipeline flush in front, every time the player pauses. SoH never reached this code. Land Web Audio first and measure: if the stall is not visible, a PBO + async readback is not worth the frame of staleness. |
 | **`-fsanitize=function` sweep** | 0.5 day | Two signature mismatches were found, but both by wasm-ld — which only sees *direct* calls. Mismatches through function-pointer slots trap at runtime, and M5 exercises far more of the tree. Enumerate them on a native build before chasing one in a browser. |
 | **Storage (M5)** | 1–2 days | Enumerate 2Ship's write paths — `SaveManager` (~30 sites, its own `saves/`), `BinarySaveConverter`, three TimeSplits trackers, `DeveloperTools`, `DeleteFileOnDeath`, `Rando/StartingItems`, `Rando/ExcludedChecks`, `Rando/Spoiler/File`, `PresetManager` — against the bridge's watch list, which currently covers the config and `saves/` only. `NewFileSetup.cpp:126` parses a spoiler file through an unguarded `json::parse`. |
@@ -855,9 +890,8 @@ Things earlier drafts flagged as risks, recorded so they are not re-litigated:
 
 ## Open questions
 
-- What corrupted the note's `Sample` before `AudioSynth_ProcessSample` asked to clear 21,600
-  bytes of DMEM. Narrowed 2026-09-21: the size cannot come from tuning, so the clear is a
-  symptom and the first write is still unaccounted for. See "The audio overrun".
+- ~~What corrupted the note's `Sample` before `AudioSynth_ProcessSample` asked to clear 21,600
+  bytes of DMEM.~~ Answered 2026-09-23: nothing did; see "The audio overrun".
 - Whether depth readback needs a depth-to-color path or just a CVar. (Until then, stop paying
   for the blits — see "What is left".)
 - Whether the pause-screen `glReadPixels` stall is visible once the audio consumer is off the

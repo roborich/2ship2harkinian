@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { playFiles } from "./lib/configs";
 import { BOOT_TIMEOUT, SLOW, TEST_TIMEOUT } from "./lib/env";
 import { useSuite, withGame } from "./lib/suite";
-import { audioDrains, audioDropsDuring } from "./lib/timing";
+import { audioDrains, audioDropsDuring, synthOversizedDuring } from "./lib/timing";
 
 // The browser build has no Web Audio player yet (see wasm-port.md, Milestone 4): it plays
 // through SDL's Emscripten backend, whose callback runs on the page's main thread. That
@@ -20,6 +20,8 @@ test("audio is produced and the device consumes it", () =>
         // ...and the queue went down again, which is the only proof the device is playing.
         // A suspended AudioContext never drains and would make every other check meaningless.
         expect(audioDrains(samples)).toBe(true);
+        // ...and nothing was synthesised from stale note state (see synthOversizedDuring).
+        expect(synthOversizedDuring(samples)).toBe(0);
     }), TEST_TIMEOUT);
 
 // The queue target leaves room for a full update below the players' drop threshold; see the
@@ -32,4 +34,5 @@ slowTest("no audio update is dropped during play", () =>
         const samples = await game.sampleStats(30_000, 100);
         expect(audioDrains(samples)).toBe(true);
         expect(audioDropsDuring(samples)).toBe(0);
+        expect(synthOversizedDuring(samples)).toBe(0);
     }), TEST_TIMEOUT);

@@ -196,10 +196,17 @@ void AudioPlayback_ProcessNotes(void) {
         sampleState = &gAudioCtx.sampleStateList[gAudioCtx.sampleStateOffset + i];
         playbackState = &note->playbackState;
         if (playbackState->parentLayer != NO_LAYER) {
-#ifndef __WIIU__
+#if !defined(__WIIU__) && !defined(__EMSCRIPTEN__)
             // OTRTODO: This skips playback if the pointer is below where memory on the N64 normally would be.
             // This does not translate well to modern platforms and how they map memory.
             // Considering that this check is not present in OoT/SoH, we may be able to remove this altogether.
+            //
+            // 2S2H [WASM] Compiled out for the browser build as it already is for Wii U, the other
+            // 32-bit target. On wasm32 every pointer is below 0x7FFFFFFF (linear memory starts at
+            // zero), so this skipped every note attached to a sequence layer: no envelope, no
+            // sample-state init, nothing audible until the layer released the note, at which point
+            // it started at one attack step with the decay already forced on. That is the "melody
+            // right, rhythm wrong, everything staccato" music. Desktop is unchanged.
             if ((uintptr_t)playbackState->parentLayer < 0x7FFFFFFF) {
                 continue;
             }

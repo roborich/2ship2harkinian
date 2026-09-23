@@ -8,6 +8,7 @@ export type StatsSample = {
     audioBuffered: number;
     audioDrops: number;
     interpolationFps: number; // 20 means frame interpolation is off
+    synthOversized: number; // synthesis loads a note cannot legitimately ask for; 0 when healthy
 };
 
 export type RateSegment = { updateRate: number; durationMs: number; measuredHz: number; expectedHz: number; error: number };
@@ -47,6 +48,13 @@ export function drawsPerTick(samples: StatsSample[]): number {
 // sample and the last.
 export function audioDropsDuring(samples: StatsSample[]): number {
     return samples[samples.length - 1].audioDrops - samples[0].audioDrops;
+}
+
+// Oversized synthesis loads between the first sample and the last. Non-zero means notes are
+// being synthesised from stale state, which is what the browser build did while playback.c
+// skipped every layered note (wasm-port.md, "The audio overrun").
+export function synthOversizedDuring(samples: StatsSample[]): number {
+    return samples[samples.length - 1].synthOversized - samples[0].synthOversized;
 }
 
 // True when the audio queue went down at some point, i.e. the device is consuming it. A

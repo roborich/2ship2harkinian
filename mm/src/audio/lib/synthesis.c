@@ -3,6 +3,17 @@
 #include "2s2h/mixer.h"
 #include <libultraship/bridge/consolevariablebridge.h>
 
+#ifdef __EMSCRIPTEN__
+// 2S2H [WASM] Tripwire for the DMEM overrun described in wasm-port.md ("The audio overrun"):
+// a note asking AudioSynth_ProcessSample for more than about twice numSamplesPerUpdate, which
+// the resampling clamp (1.99998 in AudioPlayback_NoteSetResamplingRate) makes impossible for a
+// note whose synthesis state was initialised. It happened when playback.c skipped every layered
+// note on wasm32 and synthesis ran on stale state; the emulated RSP window in mixer.c now
+// contains such a write, so this counter is the only way to see one. Read through
+// Ship_GetStats as synthOversized; the tests expect it to stay at zero.
+u32 gWasmSynthOversizedLoads = 0;
+#endif
+
 // DMEM Addresses for the RSP
 #define DMEM_TEMP 0x3B0
 #define DMEM_TEMP2 0x3C0
@@ -1017,6 +1028,13 @@ Acmd* AudioSynth_ProcessSample(s32 noteIndex, NoteSampleState* sampleState, Note
             } else {
                 numSamplesToLoadAdj = numSamplesToLoad;
             }
+
+#ifdef __EMSCRIPTEN__
+            // 2S2H [WASM] See gWasmSynthOversizedLoads at the top of the file.
+            if (numSamplesToLoadAdj > 2 * numSamplesPerUpdate) {
+                gWasmSynthOversizedLoads++;
+            }
+#endif
 
             // Load the ADPCM codeBook
             if ((sample->codec == CODEC_ADPCM) || (sample->codec == CODEC_SMALL_ADPCM)) {
