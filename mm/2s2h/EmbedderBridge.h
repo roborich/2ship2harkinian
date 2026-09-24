@@ -32,6 +32,9 @@ void Ship_EmbedderPrimeFiles(void);
 // Called once GameInteractor exists: registers the hooks behind the "scene" and "load-game"
 // events.
 void Ship_InitEmbedderBridge(void);
+// Called by the frame loop (graph.c) to run one frame: reports an exception escaping it as an
+// "error" event, then rethrows.
+void Ship_RunFrameGuarded(void (*runFrame)(void));
 // Called by the frame loop (graph.c) after each frame: reports files the game wrote.
 void Ship_EmbedderAfterFrame(void);
 // Called by the frame loop when the window has closed, before the loop is cancelled.

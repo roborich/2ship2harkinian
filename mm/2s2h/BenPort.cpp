@@ -153,8 +153,10 @@ static bool shipArchiveVersionMatch = false;
 #ifdef __EMSCRIPTEN__
 // 2S2H [WASM] Audio queue target; see OTRGlobals::Initialize.
 #define WASM_AUDIO_DESIRED_BUFFERED 4320
-// 2S2H [WASM] Both browser players (WebAudioAudioPlayer, and SDLAudioPlayer::DoPlay as the
-// fallback) discard a whole update when this many frames are already queued.
+// 2S2H [WASM] Handed to the players as AudioSettings::MaxQueuedFrames: both browser players
+// (WebAudioAudioPlayer, and SDLAudioPlayer as the fallback) discard a whole update when this
+// many frames are already queued. A define rather than only the setting, because the
+// static_assert in OTRAudio_FillBuffer checks the queue target against it at compile time.
 #define WASM_AUDIO_DROP_THRESHOLD 6000
 #endif
 
@@ -712,7 +714,10 @@ void OTRGlobals::Initialize() {
     // runs on the browser's audio thread. SDL's Emscripten player consumes from a main-thread
     // callback, so with it a long frame glitches no matter how much is queued. SampleLength
     // only matters to that fallback: it sizes SDL's ScriptProcessorNode buffer.
-    context->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = WASM_AUDIO_DESIRED_BUFFERED });
+    context->InitAudio({ .SampleRate = 32000,
+                         .SampleLength = 1024,
+                         .DesiredBuffered = WASM_AUDIO_DESIRED_BUFFERED,
+                         .MaxQueuedFrames = WASM_AUDIO_DROP_THRESHOLD });
 #else
     context->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = 1680 });
 #endif
@@ -909,8 +914,9 @@ static void OTRAudio_FillBuffer() {
 // 3 is the maximum authentic frame divisor.
 #define MAX_AUDIO_FRAMES_PER_UPDATE 3
 #ifdef __EMSCRIPTEN__
-    // 2S2H [WASM] The most the queue can hold after a top-up must stay under the players'
-    // drop threshold, or whole updates of audio are thrown away.
+    // 2S2H [WASM] The most the queue can hold after a top-up must stay under the drop
+    // threshold the players are given (AudioSettings::MaxQueuedFrames, set from this define
+    // in OTRGlobals::Initialize), or whole updates of audio are thrown away.
     static_assert(WASM_AUDIO_DESIRED_BUFFERED + MAX_AUDIO_FRAMES_PER_UPDATE * SAMPLES_HIGH <=
                       WASM_AUDIO_DROP_THRESHOLD,
                   "wasm audio target leaves no room for a full update below the players' drop threshold");
@@ -1091,26 +1097,6 @@ extern "C" void Messagebox_ShowErrorBox(char* title, char* body) {
 bool VerifyArchiveVersion(ArchiveVersion version) {
     return version.major != INT16_MAX && version.major != gBuildVersionMajor;
 }
-
-#ifdef __EMSCRIPTEN__
-// 2S2H [WASM] An exception escaping the frame callback reaches Emscripten's
-// handleException, which calls quit_ and stops the main loop: the tab stays alive, the game
-// freezes, and the console shows only "Uncaught Exception {stack: undefined}" with no
-// message. Name it, so the next one is diagnosable rather than mysterious.
-extern "C" void Ship_RunFrameGuarded(void (*runFrame)(void)) {
-    try {
-        runFrame();
-    } catch (const std::exception& e) {
-        SPDLOG_ERROR("Unhandled exception in frame: {}", e.what());
-        Ship_EmbedderError(e.what());
-        throw;
-    } catch (...) {
-        SPDLOG_ERROR("Unhandled non-standard exception in frame");
-        Ship_EmbedderError("non-standard exception");
-        throw;
-    }
-}
-#endif
 
 extern "C" void InitOTR(int argc, char* argv[]) {
 #ifdef __EMSCRIPTEN__
@@ -1357,10 +1343,11 @@ void RunCommands(Gfx* Commands, int time, int step, int denom, int count) {
 }
 
 // C->C++ Bridge
-extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
+// Desktop: hand this tick's audio to the audio thread. Browser: synthesise it inline.
+static void OTRAudio_BeginUpdate() {
 #ifdef __EMSCRIPTEN__
-    // 2S2H [WASM] Single-threaded: synthesise this update's audio inline. The handshake
-    // below would otherwise block forever on an audio thread that is never started.
+    // 2S2H [WASM] Single-threaded: synthesise this update's audio inline. The desktop
+    // handshake would otherwise block forever on an audio thread that is never started.
     OTRAudio_FillBuffer();
 #else
     {
@@ -1370,17 +1357,37 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
 
     audio.cv_to_thread.notify_one();
 #endif
+}
+
+// Desktop: wait for the audio thread. Browser: nothing to wait for.
+static void OTRAudio_EndUpdate() {
+#ifndef __EMSCRIPTEN__
+    std::unique_lock<std::mutex> Lock(audio.mutex);
+    while (audio.processing) {
+        audio.cv_from_thread.wait(Lock);
+    }
+#endif
+}
+
+// Desktop: the interpolation target. Browser: one draw per tick, 60 / R_UPDATE_RATE.
+static int Graph_TargetFps() {
 #ifdef __EMSCRIPTEN__
     // 2S2H [WASM] One frame per game tick. Interpolated frames need a loop paced by the
     // display to be seen; this one ticks at the game's rate (graph.c), so they would be drawn
     // back to back and only the last would reach the screen, at up to three times the cost of
     // a tick.
     // Deliberately redundant with GetInterpolationFPS() returning 20 here: keep it, so the
-    // browser's draw rate says what it is instead of depending on the == 20 branch below.
-    int target_fps = 60 / R_UPDATE_RATE;
+    // browser's draw rate says what it is instead of depending on the == 20 branch in
+    // Graph_ProcessGfxCommands.
+    return 60 / R_UPDATE_RATE;
 #else
-    int target_fps = OTRGlobals::Instance->GetInterpolationFPS();
+    return OTRGlobals::Instance->GetInterpolationFPS();
 #endif
+}
+
+extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
+    OTRAudio_BeginUpdate();
+    int target_fps = Graph_TargetFps();
     static int last_fps;
     static int last_update_rate;
     static int time;
@@ -1428,14 +1435,7 @@ extern "C" void Graph_ProcessGfxCommands(Gfx* commands) {
     last_fps = fps;
     last_update_rate = R_UPDATE_RATE;
 
-#ifndef __EMSCRIPTEN__
-    {
-        std::unique_lock<std::mutex> Lock(audio.mutex);
-        while (audio.processing) {
-            audio.cv_from_thread.wait(Lock);
-        }
-    }
-#endif
+    OTRAudio_EndUpdate();
 
     bool curAltAssets = CVarGetInteger("gEnhancements.Mods.AlternateAssets", 0);
     if (prevAltAssets != curAltAssets) {

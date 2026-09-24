@@ -11,7 +11,6 @@
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #include "2s2h/EmbedderBridge.h"
-void Ship_RunFrameGuarded(void (*runFrame)(void));
 #endif
 
 // Variables are put before most headers as a hacky way to bypass bss reordering
