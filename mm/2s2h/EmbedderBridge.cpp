@@ -237,10 +237,17 @@ extern "C" EMSCRIPTEN_KEEPALIVE const char* Ship_GetStats(void) {
 
 // ---- entry points ------------------------------------------------------------------------
 
+// Must run before anything in InitOTR can write a watched file: the context rewrites a stale
+// Window.AudioBackend and the version updaters migrate the config, both before the bridge's
+// hooks can be registered. Priming later would record the game's copy as the host's, and the
+// host would never hear of those writes.
+void Ship_EmbedderPrimeFiles(void) {
+    ReportFileChanges();
+}
+
 void Ship_InitEmbedderBridge(void) {
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSaveLoad>(OnSaveLoad);
     GameInteractor::Instance->RegisterGameHook<GameInteractor::OnSceneInit>(OnSceneInit);
-    ReportFileChanges(); // prime with the host's files
 }
 
 void Ship_EmbedderAfterFrame(void) {

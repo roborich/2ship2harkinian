@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { playFiles } from "./lib/configs";
+import { playFiles, staleDesktopConfig } from "./lib/configs";
 import { BOOT_TIMEOUT, TEST_TIMEOUT } from "./lib/env";
 import { type Game } from "./lib/game";
 import { useSuite, withGame } from "./lib/suite";
@@ -65,7 +65,7 @@ test("a command sent from inside an event listener is accepted", () =>
     }), TEST_TIMEOUT);
 
 // The page owns storage: the module writes into MEMFS and reports what changed, so the host
-// can persist it. Files the host supplied at boot are not echoed back.
+// can persist it.
 test("the config the game writes comes back as a file-saved event", () =>
     withGame(suite, { inlineFiles: playFiles() }, async (game) => {
         await bootToScene(game);
@@ -75,4 +75,16 @@ test("the config the game writes comes back as a file-saved event", () =>
         });
         expect(saved.event.byteLength).toBeGreaterThan(0);
         expect(JSON.parse((await game.savedText("/2ship2harkinian.json"))!)).toHaveProperty("CVars");
+    }), TEST_TIMEOUT);
+
+// A config carried over from a desktop install is corrected at boot (here, an audio backend
+// the browser does not have), and the host must be told, or it hands back the stale copy on
+// every boot. This held before the bridge primed its snapshot first thing in InitOTR, but
+// only because controller setup and the first frame happen to save the config again.
+test("a config the game corrects at boot comes back corrected", () =>
+    withGame(suite, { inlineFiles: { "/2ship2harkinian.json": staleDesktopConfig() } }, async (game) => {
+        const scene = await bootToScene(game);
+        const saved = await game.waitForEvent("file-saved", { match: (e) => e.path === "/2ship2harkinian.json" });
+        expect(saved.index).toBeLessThan(scene.index);
+        expect(JSON.parse((await game.savedText("/2ship2harkinian.json"))!).Window.AudioBackend).toBe("webaudio");
     }), TEST_TIMEOUT);

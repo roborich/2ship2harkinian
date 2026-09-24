@@ -26,6 +26,11 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+// Called first thing in InitOTR: records the files the host supplied, so that everything the
+// game writes from then on, boot included, is reported.
+void Ship_EmbedderPrimeFiles(void);
+// Called once GameInteractor exists: registers the hooks behind the "scene" and "load-game"
+// events.
 void Ship_InitEmbedderBridge(void);
 // Called by the frame loop (graph.c) after each frame: reports files the game wrote.
 void Ship_EmbedderAfterFrame(void);

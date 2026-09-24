@@ -1113,6 +1113,9 @@ extern "C" void Ship_RunFrameGuarded(void (*runFrame)(void)) {
 #endif
 
 extern "C" void InitOTR(int argc, char* argv[]) {
+#ifdef __EMSCRIPTEN__
+    Ship_EmbedderPrimeFiles();
+#endif
     OTRGlobals::Instance = new OTRGlobals();
     OTRGlobals::Instance->RunExtract(argc, argv);
 
