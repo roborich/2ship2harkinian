@@ -22,11 +22,11 @@ which it does — through SDL, on the page's main thread. The player it was supp
 
 | | |
 |---|---|
-| `2ship.wasm` | 23.6 MB raw · 6.5 MB gzip · **3.5 MB brotli** |
-| `2ship.js` / `2ship.data` | 0.4 MB / 1.8 MB |
+| `2ship.wasm` | 23.3 MB raw · 6.4 MB gzip · **3.5 MB brotli** (3.46; 3.56 with `-export-dynamic`) |
+| `2ship.js` / `2ship.data` | 0.2 MB / 1.8 MB |
 | Tick rate | 60/`R_UPDATE_RATE` Hz, within 5%, one frame drawn per tick |
 | Heap | 512 MB at the initial size, no growth observed over ~2 minutes |
-| Tests | 37, passing (`mm/wasm/tests`) — two of them vacuously; see below |
+| Tests | 38, passing (`mm/wasm/tests`) — two of them vacuously; see below |
 
 3.5 MB over the wire is an ordinary web download, so **size is not a constraint** and no
 splitting or streaming strategy is needed — the same conclusion the SoH port reached.
@@ -557,8 +557,11 @@ Do not re-discover these. From the SoH branch:
   `-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=1000`. Reproduce in seconds
   with `--js-flags="--no-wasm-dynamic-tiering --no-wasm-lazy-compilation"`. 2Ship's Rando
   tables are the obvious candidate for the same shape.
-- **`-Wl,-export-dynamic` must stay** until that inlining cap is in place: exported functions
-  are never inlined, and it was masking the problem above.
+- **`-Wl,-export-dynamic` is desktop-only now.** It had to stay until that inlining cap was in
+  place, because exported functions are never inlined and it was masking the problem above.
+  With the cap it went: exports fell from 1561 to 12, `2ship.js` from 429 KB to 223 KB and
+  `2ship.wasm` by 460 KB, with `artifacts.test.ts` and `smoke-tiering.test.ts` still passing.
+  If tier-up regresses, lower the cap rather than restore the flag.
 - **SDL's Emscripten audio callback runs on the main thread** (a ScriptProcessorNode
   `onaudioprocess`), so any frame longer than ~20-40 ms crackles *however much* audio is
   queued — every `DesiredBuffered` value tunes a queue upstream of the real bottleneck. The

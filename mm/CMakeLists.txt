@@ -458,12 +458,14 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
 
         target_link_options(${PROJECT_NAME} PRIVATE
             $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:-pthread>
-            # 2S2H [WASM] Kept for the Emscripten link too, though there it exports symbols
-            # nothing calls. Exported functions are never inlined, and without that Binaryen
-            # inlines small helpers thousands of times into large table builders, which V8
-            # then crashes the renderer compiling. Dropping the exports needs the Binaryen
-            # inlining limit below to prevent that first.
-            -Wl,-export-dynamic
+            # 2S2H [WASM] Desktop only. In the browser build it made every non-static function
+            # a wasm export that nothing calls -- the page reaches the module only through
+            # EMSCRIPTEN_KEEPALIVE entry points -- and exports are never inlined or removed.
+            # That used to be load-bearing by accident: it stopped Binaryen folding large
+            # single-caller table builders into functions V8 crashed compiling. The
+            # --one-caller-inline-max-function-size cap in the packaging block below prevents
+            # that directly; if tier-up ever regresses, lower the cap rather than restore this.
+            $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:-Wl,-export-dynamic>
         )
     endif()
 endif()
