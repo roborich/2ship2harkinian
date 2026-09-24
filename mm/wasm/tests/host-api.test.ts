@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { playFiles, staleDesktopConfig } from "./lib/configs";
+import { bootWarpConfig, playFiles, staleDesktopConfig } from "./lib/configs";
 import { BOOT_TIMEOUT, TEST_TIMEOUT } from "./lib/env";
 import { type Game } from "./lib/game";
 import { useSuite, withGame } from "./lib/suite";
@@ -38,6 +38,29 @@ test("a scene event carries MM's own fields", () =>
         expect(typeof event.isNight).toBe("boolean");
         expect(typeof event.playerForm).toBe("number");
     }), TEST_TIMEOUT);
+
+// §4: a host boots straight into a scene through the config alone, on a new save at day 1,
+// 8:00, in human form. The point is a spot in Termina Field known to have floor under it.
+test("a boot warp point in the config starts a new game in that scene", () => {
+    const termina = { entranceId: 0x5400, roomNum: 0, pos: { x: -1940.3, y: -82.4, z: 1648.6 }, rotY: 27003 };
+    return withGame(suite, { inlineFiles: playFiles(bootWarpConfig(termina)) }, async (game) => {
+        const loaded = await game.waitForEvent("load-game", { timeout: BOOT_TIMEOUT });
+        const { event } = await game.waitForEvent("scene", { from: loaded.index });
+        expect(loaded.event.fileNum).toBe(255);
+        expect(event.sceneId).toBe(0x2d); // SCENE_00KEIKOKU
+        expect(event.entrance).toBe(termina.entranceId);
+        expect(event.day).toBe(1);
+        expect(event.time).toBeGreaterThanOrEqual(0x5555); // CLOCK_TIME(8, 0)
+        expect(event.time).toBeLessThan(0x5655);
+        expect(event.playerForm).toBe(4); // PLAYER_FORM_HUMAN
+
+        // §3: the play state is up, and `entrance` reads its argument as hex.
+        const from = await game.eventCount();
+        expect(await game.run("entrance d800")).toBe(0); // ENTRANCE(SOUTH_CLOCK_TOWN, 0)
+        const warped = await game.waitForEvent("scene", { from, timeout: 30_000 });
+        expect(warped.event.sceneId).toBe(0x6f); // SCENE_CLOCKTOWER
+    });
+}, TEST_TIMEOUT);
 
 test("Ship_GetStats reports a running loop", () =>
     withGame(suite, { inlineFiles: playFiles() }, async (game) => {

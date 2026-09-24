@@ -13,10 +13,21 @@ Set before `2ship.js` loads. Keys are absolute VFS paths, values `Uint8Array`:
 Module.shipFiles = {
   '/mm.o2r':                bytes,  // required
   '/2ship2harkinian.json':  bytes,  // optional: config
-  '/saves/file1.sav':       bytes,  // optional: saves
-  '/mods/<name>.o2r':       bytes,  // optional: mod layers, loaded in sorted filename order
+  '/saves/file1.json':      bytes,  // optional: saves, file<N>.json, and file<N>backup.json
+  '/mods/<name>.o2r':       bytes,  // optional: mod layers
 };
 ```
+
+`mm.o2r` is accepted from any 2Ship with the same **major** version as this build (5.x): the
+game compares nothing else (`VerifyArchiveVersion` in `mm/2s2h/BenPort.cpp`). An archive a user
+extracted with a 5.x desktop install works as it is.
+
+Mods are the `.o2r` files anywhere under `/mods/`, named by filename without the extension.
+With no `gSettings.EnabledMods` in the config they load in sorted path order. With one, its
+`|`-separated names load in that order first, any other mods after them in sorted path order,
+and names with no file are dropped from the list, which the game then saves back
+(`UpdateModFiles` in `mm/2s2h/Enhancements/ModMenu/ModMenu.cpp`). **Mods have not been loaded
+in the browser build yet**; the code path is the desktop one, unexercised here.
 
 Do not supply `2ship.o2r`; it is inside the module, packaged in `2ship.data` and
 version-locked to the binary. A copy written here makes the unpack fail.
@@ -55,7 +66,7 @@ the first `2ship` event is a safe signal. The command takes effect on the next f
 
 | Command | Needs play state | Does |
 |---|---|---|
-| `entrance <index>` | yes | Instant warp to an entrance index; a `scene` event follows. |
+| `entrance <hex>` | yes | Instant warp to a packed entrance, **read as hex** (`entrance d800` is South Clock Town); a `scene` event follows. |
 | `spawn <...>` | yes | Spawns an actor. |
 | `pos [x y z]` | yes | Reads or sets the player's position. |
 | `reload` | yes | Re-enters the current entrance (reloads the scene). |
@@ -68,13 +79,55 @@ the first `2ship` event is a safe signal. The command takes effect on the next f
 Every command is registered with its arguments in `DebugConsole_Init()` in
 `mm/2s2h/DeveloperTools/DebugConsole.cpp`, and they all work here the same way.
 
-**There is no `warp` command yet.** SoH has one that takes an age and a time of day and
-starts a fresh game when called outside gameplay, which is how a host boots straight into a
-scene. The MM equivalent — an entrance plus a day and a clock time — is not written; until
-it is, a host boots into the game the way a player does (`file_select`, then input) and then
-uses `entrance`.
+There is no `warp` command. To start in a scene, boot to a warp point (§4); to move within a
+game, use `entrance`.
 
-## 4. Diagnostics: `Ship_GetStats` (unstable)
+## 4. Booting into a scene from the config
+
+A host can skip the title and file select and start the game at a chosen spot through the
+config it hands in. This is the game's own Developer Tools > Warp Points feature
+(`mm/2s2h/DeveloperTools/WarpPoint.cpp`). This one is a spot in Termina Field:
+
+```json
+{
+  "CVars": { },
+  "WarpPoints": {
+    "prelude": {
+      "bootToPoint": true,
+      "entranceId": 21504,
+      "roomNum": 0,
+      "pos": { "x": -1940.3, "y": -82.4, "z": 1648.6 },
+      "rotY": 27003
+    }
+  }
+}
+```
+
+- `entranceId` is a packed entrance, `(entrance scene << 9) | (spawn << 4) | layer`, where the
+  entrance scene is an `ENTR_SCENE_*` index (`mm/include/z64scene.h`), a different numbering
+  from the `sceneId` the `scene` event carries: 21504 is `0x2A << 9`, Termina Field, whose
+  `sceneId` is `0x2D`. It is the same
+  value the `scene` event reports as `entrance` (in decimal there, as here), so a host can
+  hand back one it was given. The player appears at `pos` rather than at the spawn; the low
+  four bits pick the scene layer.
+- `roomNum` is the room `pos` is in, `pos` a world position, and `rotY` the facing as a
+  binary angle (`0x8000` is half a turn).
+- The first point with `bootToPoint: true`, in name order, is used.
+- `gEnhancements.Cutscenes.SkipToFileSelect` must be 0 or absent; with it on, the warp point is
+  ignored.
+
+What the boot gives you is **a new game, not a save**: day 1, 8:00, human form, three
+hearts, the Kokiri Sword and no other items, and first-cycle story flags
+(`Sram_InitNewSave`). There is no way yet to choose the day, the time or the form. The host
+sees `load-game` with `fileNum: 255`, then `scene`, and from then on play-state commands
+work.
+
+A config written with no `ConfigVersion` that still carries the legacy
+`gDeveloperTools.WarpPoint.*` CVars from an old desktop install has those migrated at boot into
+a `WarpPoints` block that **replaces** the one supplied. Drop those CVars, or keep the
+`ConfigVersion` the game wrote.
+
+## 5. Diagnostics: `Ship_GetStats` (unstable)
 
 For tests and profiling, not for building on: the fields can change without notice.
 
@@ -93,8 +146,8 @@ and this build always reports 20 whatever the config asks for. `sceneId` is `-1`
 state. `synthOversized` counts audio synthesis loads larger than a note can legitimately ask for;
 it is zero on a healthy build and non-zero means the note update path is being skipped again.
 
-## 5. Converting a ROM
+## 6. Converting a ROM
 
 Not built yet. SoH ships a second, independent module (`soh-extract.js`) that turns a ROM
 into the archive §1 asks for; the 2Ship equivalent is Milestone 6 in `wasm-port.md`. Until
-then, produce `mm.o2r` with a desktop build and hand it to the page.
+then, the page needs an `mm.o2r` extracted by a 2Ship 5.x desktop install (§1).

@@ -48,11 +48,12 @@ For local play, `bun run serve` in `mm/wasm/tests` serves the build with `host.h
 
 ### Getting an `mm.o2r`
 
-There is no in-browser ROM converter yet (Milestone 6 in `wasm-port.md`). Produce the
-archive with a desktop build — put a ROM at `OTRExporter/mm.z64` and run the `ExtractAssets`
-target — and hand the result to the page. It must come from the same build as the binary:
-the archive records the port version and the game refuses one from any other, reporting it
-through the `error` event rather than failing at the first resource load.
+There is no in-browser ROM converter yet (Milestone 6 in `wasm-port.md`). Use the archive a
+2Ship desktop install extracted, or build one — put a ROM at `OTRExporter/mm.z64` and run the
+`ExtractAssets` target — and hand the result to the page. It must come from a 2Ship with the
+same major version as the binary (5.x): the archive records the port version, and the game
+refuses one from another major version, reporting it through the `error` event rather than
+failing at the first resource load.
 
 ## What the browser target does differently
 
@@ -105,7 +106,7 @@ nothing derived from a ROM.
 - `host.html?memtrace` overlays the wasm and JS heap sizes and keeps a trail in
   `localStorage` that survives a renderer crash:
   `JSON.parse(localStorage.getItem('2ship-memtrace-prev'))`.
-- `Ship_GetStats` returns frame, audio and scene counters (`HOST-API.md` §4).
+- `Ship_GetStats` returns frame, audio and scene counters (`HOST-API.md` §5).
 - **For anything that looks like memory corruption, build with AddressSanitizer** before
   theorising. The recipe, and the two details that make it usable here, are in
   `wasm-port.md`, "The tool that found both". It found the audio overrun in one run after a

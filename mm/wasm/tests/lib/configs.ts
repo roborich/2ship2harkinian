@@ -21,6 +21,18 @@ export function playConfig(): any {
 
 export const playFiles = (config: any = playConfig()) => ({ "/2ship2harkinian.json": JSON.stringify(config, null, 4) });
 
+export type WarpPoint = { entranceId: number; roomNum: number; pos: { x: number; y: number; z: number }; rotY: number };
+
+// The play config booting straight to one warp point, in the `WarpPoints` block HOST-API.md §4
+// documents. The legacy gDeveloperTools.WarpPoint CVars go: in a config with no ConfigVersion
+// their migration replaces the whole block (ConfigUpdaters.cpp, MigrateWarpPoints).
+export function bootWarpConfig(point: WarpPoint): any {
+    const config = playConfig();
+    delete config.CVars.gDeveloperTools.WarpPoint;
+    config.WarpPoints = { host: { ...point, bootToPoint: true } };
+    return config;
+}
+
 // What an embedder hands over from someone's desktop install: a window and audio backend
 // this build does not have, and a saved warp point.
 export function staleDesktopConfig(): string {

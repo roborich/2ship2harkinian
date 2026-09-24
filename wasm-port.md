@@ -861,7 +861,7 @@ have landed and stay for their notes:
 | **Depth readback** | 1–2 days | Compiled out under `USE_OPENGLES` because WebGL2 `readPixels` cannot read `GL_DEPTH_STENCIL`. Four consumers: `z_kankyo.c:532` (sun), `z_lights.c:411` (glow), and `z_en_invadepoh.c:1301` / `z_en_invadepoh_demo.c:581` (UFO flares), the last two reaching the single-coordinate branch every frame because neither calls Prepare. Occlusion is now permanently off (see above), so these effects draw through walls. Needs a depth-to-color path or a CVar to suppress them. |
 | **Measure** | 1 day | Performance under load, scene-load hitching on the synchronous ResourceManager (Termina Field is the load to measure), and the memory ceiling on Safari/iOS. All still unmeasured. |
 | **Controllers, input polish** | 1 day | Emscripten's SDL2 has a working Gamepad-API backend; untested. |
-| **A `warp` console command** | 1 day | 2Ship has `entrance`/`spawn`/`pos` but nothing with a day-and-time vocabulary, so a host cannot boot straight into a scene the way SoH's can. New work, not a retarget. |
+| **Day, time and form for the boot warp** | 1 day | A host already boots straight into a scene through the config's `WarpPoints` block (`HOST-API.md` §4, tested in `host-api.test.ts`), but always on a new save at day 1, 8:00, human form (`WarpPoint.cpp:52-57`). Add the three fields to the point, and a `warp` console command taking the same vocabulary for use mid-game. New work, not a retarget. |
 | **M6: ROM -> o2r converter** | 2–3 days | `2ship-extract.js`, modelled on SoH's `soh/wasm/extract/`. Cheaper here: 2 extraction configs against SoH's 14. |
 
 Roughly **2 weeks** to a build that is playable, persists what it should, and converts its

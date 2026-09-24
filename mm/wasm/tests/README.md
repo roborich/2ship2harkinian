@@ -23,8 +23,8 @@ SHIP_WASM_FILES=$SHIP_WASM_BUILD/hostfiles    # mm.o2r, 2ship2harkinian.json
 ```
 
 Both default to `build-wasm-rel/mm` and `build-wasm-rel/mm/hostfiles` in the repo. `mm.o2r` must come
-from the same build as the binary — the archive records the port version and the game refuses
-one from another build, which the boot tests rely on.
+from a 2Ship with the same major version as the binary — the archive records the port version
+and the game refuses one from another major version, which the boot tests rely on.
 
 ## Environment
 
@@ -45,7 +45,7 @@ one from another build, which the boot tests rely on.
   a black canvas; `host.html` boots; optional files really are optional.
 - `smoke.test.ts` — boots, renders, and keeps running.
 - `host-api.test.ts` — the contract in `mm/wasm/HOST-API.md`: event shapes, console return
-  values, commands from inside a listener, files coming back out.
+  values, commands from inside a listener, files coming back out, booting to a warp point.
 - `audio.test.ts` — audio is produced and the device consumes it.
 - `timing.test.ts` (slow) — the loop ticks at `60 / R_UPDATE_RATE` Hz and draws one frame per
   tick.

@@ -353,10 +353,10 @@ export class Game {
 
 // Title -> file select -> file 1. Resolves once the save has loaded.
 //
-// There is no `warp` command in 2Ship (see mm/wasm/HOST-API.md §3), so a test that needs a
-// play state has to walk the menus the way a player does. The sleeps are generous because
-// file select runs at 60 Hz while gameplay runs at 20, and the transitions between them are
-// not instant.
+// For a test that needs a real save rather than any play state; one that only needs a play
+// state boots to a warp point instead (mm/wasm/HOST-API.md §4, bootWarpConfig). The sleeps are
+// generous because file select runs at 60 Hz while gameplay runs at 20, and the transitions
+// between them are not instant.
 export async function loadFirstSave(game: Game): Promise<{ event: ShipEvent; index: number }> {
     const from = await game.eventCount();
     if ((await game.run("file_select")) !== 0) {
