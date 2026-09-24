@@ -11,14 +11,13 @@ findings, traps and measurements from that work are written up in that repo's
 discovery is already paid for. This document records what carries over, what does not, and
 what is genuinely new here.
 
-## Status (2026-09-21)
+## Status (2026-09-23)
 
-**Milestones 0-4 are done, bar the audio player.** The game boots in a browser, renders
-Termina/Clock Town correctly, runs at the right speed, plays audio and responds to the console.
-Milestone 3 (a GUI-only boot) was skipped: the full game rendered on the first attempt, so
-there was nothing to isolate. Milestone 4 was marked complete on the strength of "plays audio",
-which it does — through SDL, on the page's main thread. The player it was supposed to land is
-§"Milestone 4b".
+**Milestones 0-4 are done, including the Web Audio player (§"Milestone 4b").** The game boots
+in a browser, renders Termina/Clock Town correctly, runs at the right speed, plays audio through
+an AudioWorklet and responds to the console. Milestone 3 (a GUI-only boot) was skipped: the
+full game rendered on the first attempt, so there was nothing to isolate. SDL's main-thread
+player remains as the fallback for a browser without AudioWorklet.
 
 | | |
 |---|---|
@@ -26,7 +25,7 @@ which it does — through SDL, on the page's main thread. The player it was supp
 | `2ship.js` / `2ship.data` | 0.2 MB / 1.8 MB |
 | Tick rate | 60/`R_UPDATE_RATE` Hz, within 5%, one frame drawn per tick |
 | Heap | 512 MB at the initial size, no growth observed over ~2 minutes |
-| Tests | 38, passing (`mm/wasm/tests`) — two of them vacuously; see below |
+| Tests | 42, passing (`mm/wasm/tests`), plus 4 opt-in slow and soak tests |
 
 3.5 MB over the wire is an ordinary web download, so **size is not a constraint** and no
 splitting or streaming strategy is needed — the same conclusion the SoH port reached.
@@ -844,17 +843,16 @@ services that do not exist in a browser, not UI surface area.
 
 ## What is left
 
-Milestones 0-4 are done bar the audio player (see Status, and Milestone 4b). What remains, in
-the order I would do it — the first four rows are small, and every one of them is currently
-masked by a test that passes:
+Milestones 0-4 are done (see Status). What remains, in the order I would do it; struck rows
+have landed and stay for their notes:
 
 | | | |
 |---|---|---|
-| **Audio backend availability guard + menu filter** | ~15 lines | Port LUS `30d0cf54` and SoH's `f3d5e096c`. A config naming `coreaudio` silences the build through `NullAudioPlayer` with no diagnostic. Do this first: otherwise it is a false lead the moment anyone touches audio. Add `audioDrains(...)` to `mm/wasm/tests/smoke.test.ts:26`, which covers this case today and never listens. |
-| **Force `GetInterpolationFPS()` to 20 under Emscripten** | ~1 hour | `mm/2s2h/BenPort.cpp:861-870`. Closes the `is_recording` path for a host-supplied desktop config, not just the UI — better than SoH's UI-only guard — and lets `:1365` drop its `#ifdef`. Guard the three widgets at `mm/2s2h/BenGui/BenMenu.cpp:623-652` too, so they are not inoperative controls. |
+| ~~**Audio backend availability guard + menu filter**~~ | done | Landed in `304569201`: a config naming a backend this build lacks now plays through the platform's first backend, the menu lists only this build's backends, and `smoke.test.ts` checks the queue drains. |
+| ~~**Force `GetInterpolationFPS()` to 20 under Emscripten**~~ | done | Landed in `8033d5f71`, which also hides the three settings that feed it (Current FPS, Match Refresh Rate, Enable Vsync). |
 | ~~**Early-return `OTRGetPixelDepth*` under Emscripten**~~ | done | Landed. Removes a `glBlitFramebuffer` per coordinate per frame that nothing reads, the uninitialised single-coordinate read, and a `glDisable(GL_SCISSOR_TEST)` that `gfx_opengl.cpp` never re-enabled. Returns the game's own no-depth sentinel, so the sun flare, the point glows and the two Invadepoh UFO flares now draw — they previously never drew, because the batched readback was zero-filled. **Needs an eyeball**: they also draw through geometry that should hide them. |
-| **Fix the vacuous timing test** | minutes | `mm/wasm/tests/timing.test.ts:32` → `config.CVars.gInterpolationFPS = 60`. Until then the one-draw-per-tick guarantee is untested. |
-| **Web Audio player** | 1–2 days | See Milestone 4b for the full plan. Also the cheapest mitigation for the pause-screen readback stall, which becomes survivable rather than audible. |
+| ~~**Fix the vacuous timing test**~~ | done | Landed in `8033d5f71`: `timing.test.ts` boots with `gInterpolationFPS = 60` and asserts both one draw per tick and `interpolationFps` 20. |
+| ~~**Web Audio player**~~ | done | Landed in libultraship `1d7d93a3` and `0f0b6d1c1`; the four Milestone 4b tests are in `audio.test.ts`. |
 | ~~**Why the DMEM clear was oversized**~~ | done | Not corruption: `playback.c:203` skipped every layered note on wasm32, which was also why the music was wrong. See "The audio overrun", *Resolved 2026-09-23*. |
 | **The pause-screen framebuffer readback** | 1–2 days, or 0 | `z_play.c:1520` → a synchronous 307 KB `glReadPixels` plus a 76,800-iteration conversion, with a pipeline flush in front, every time the player pauses. SoH never reached this code. Land Web Audio first and measure: if the stall is not visible, a PBO + async readback is not worth the frame of staleness. |
 | **`-fsanitize=function` sweep** | 0.5 day | Two signature mismatches were found, but both by wasm-ld — which only sees *direct* calls. Mismatches through function-pointer slots trap at runtime, and M5 exercises far more of the tree. Enumerate them on a native build before chasing one in a browser. |
@@ -867,9 +865,7 @@ masked by a test that passes:
 | **M6: ROM -> o2r converter** | 2–3 days | `2ship-extract.js`, modelled on SoH's `soh/wasm/extract/`. Cheaper here: 2 extraction configs against SoH's 14. |
 
 Roughly **2 weeks** to a build that is playable, persists what it should, and converts its
-own ROM. The first four rows are a day between them and remove three sources of per-frame work
-plus one false lead; the Web Audio player is what stands between "renders correctly" and
-"sounds right".
+own ROM.
 
 ### Resolved along the way
 

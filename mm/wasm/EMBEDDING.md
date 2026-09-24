@@ -32,8 +32,8 @@ Outputs, in `build-wasm/mm`:
 
 | | |
 |---|---|
-| `2ship.wasm` | 23.6 MB raw · 6.5 MB gzip · **3.5 MB brotli** |
-| `2ship.js` | 0.4 MB |
+| `2ship.wasm` | 23.3 MB raw · 6.4 MB gzip · **3.5 MB brotli** |
+| `2ship.js` | 0.2 MB |
 | `2ship.data` | 1.8 MB — holds `2ship.o2r` and nothing else |
 | `host.html`, `HOST-API.md` | copied from `mm/wasm/` |
 
@@ -73,9 +73,15 @@ through the `error` event rather than failing at the first resource load.
 - **The canvas renders at CSS resolution.** `SDL_WINDOW_ALLOW_HIGHDPI` is off, because SDL
   would size the backing store by `devicePixelRatio` while ImGui keeps reporting CSS pixels
   and LUS mixes the two. Use the internal-resolution setting to supersample.
-- **Audio plays through SDL's Emscripten backend**, whose callback runs on the page's main
-  thread — so a long frame is audible however deep the queue is. A Web Audio player that
-  runs the consumer on the audio thread exists on the SoH side and is not ported yet.
+- **Audio plays through an AudioWorklet** (`Window.AudioBackend` `"webaudio"`, the default),
+  so the consumer runs on the browser's audio thread and a long frame is covered by what is
+  already queued. No `SharedArrayBuffer`, so no cross-origin isolation is needed. A config
+  naming a backend this build lacks (`"coreaudio"` from a Mac) plays through Web Audio and is
+  saved back corrected. `"sdl"` still works and is the automatic fallback, for this session
+  only, when the worklet cannot load; its callback runs on the main thread, where a long
+  frame is audible. The browser starts the AudioContext only after a user gesture: a key,
+  click or touch on the page. **A gamepad button is not a gesture**, so a controller-only
+  session needs one touch or click first.
 - **No ROM extractor, no crash handler, no gfx debugger, no Opus.** Opus and OpusFile have no
   Emscripten port, so custom *streamed Opus* music decodes to silence; Ogg Vorbis, MP3 and
   FLAC go through dr_libs and work.
