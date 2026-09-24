@@ -6,33 +6,36 @@
 # them. Rather than patch every find_package call site, each dependency is declared with
 # OVERRIDE_FIND_PACKAGE (CMake >= 3.24), which redirects find_package to a source build.
 #
-# Emscripten *does* ship ports for SDL2, ogg, vorbis and zlib; those are requested with
-# --use-port on the compile/link line instead (see the EMSCRIPTEN branch in the root
-# CMakeLists). Opus and OpusFile have no port and no source build here yet -- see
-# wasm-port.md.
+# Emscripten *does* ship ports for SDL2, ogg, vorbis, zlib and libpng; those are requested
+# with --use-port on the compile/link line instead (see the EMSCRIPTEN branch in the root
+# CMakeLists), and find_package is pointed at the port where a dependency asks for one.
+# Opus and OpusFile have no port and no source build here yet -- see wasm-port.md.
 
 include(FetchContent)
 
 set(FETCHCONTENT_QUIET OFF)
 
 # --- zlib -------------------------------------------------------------------
-# libzip does find_package(ZLIB REQUIRED) and wants the ZLIB::ZLIB target, which upstream
-# zlib's own CMakeLists does not define. The redirect "extra" file below is CMake's
-# documented hook for filling that gap.
-FetchContent_Declare(
-    ZLIB
-    GIT_REPOSITORY https://github.com/madler/zlib.git
-    GIT_TAG v1.3.1
-    OVERRIDE_FIND_PACKAGE
-)
-file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/zlib-extra.cmake"
+# From the port, not from source. --use-port=libpng pulls in the zlib port whatever this file
+# does, so a second zlib built here meant two zlib.h on the include path and two libz.a at
+# link, of different versions, resolved by link order.
+#
+# libzip and StormLib still call find_package(ZLIB) and link ZLIB::ZLIB. A config file in
+# the redirects directory answers that before any Find module is tried; the target it
+# defines is empty because the port flags, applied globally, already supply the headers and
+# the library. The version file accepts any requested version: the port's is Emscripten's to
+# choose, and libzip only asks for 1.1.2 or later.
+file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/zlib-config.cmake"
 "if(NOT TARGET ZLIB::ZLIB)
-    add_library(ZLIB::ZLIB ALIAS zlibstatic)
+    add_library(ZLIB::ZLIB INTERFACE IMPORTED GLOBAL)
 endif()
-set(ZLIB_INCLUDE_DIR \"\${zlib_SOURCE_DIR}\" \"\${zlib_BINARY_DIR}\" CACHE INTERNAL \"\")
-set(ZLIB_INCLUDE_DIRS \${ZLIB_INCLUDE_DIR})
+set(ZLIB_FOUND TRUE)
+set(ZLIB_INCLUDE_DIRS \"\")
 set(ZLIB_LIBRARY ZLIB::ZLIB)
 set(ZLIB_LIBRARIES ZLIB::ZLIB)
+")
+file(WRITE "${CMAKE_FIND_PACKAGE_REDIRECTS_DIR}/zlib-config-version.cmake"
+"set(PACKAGE_VERSION_COMPATIBLE TRUE)
 ")
 
 # --- libzip -----------------------------------------------------------------
