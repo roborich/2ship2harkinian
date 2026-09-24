@@ -34,9 +34,9 @@ Build it with:
 
 ```
 cmake --build build-cmake --target Generate2ShipOtr     # 2ship.o2r, from a desktop build
-emcmake cmake -H. -Bbuild-wasm -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+emcmake cmake -H. -Bbuild-wasm-rel -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
   -DSHIP_WASM_ASSET_DIR=$PWD/build-cmake/mm
-cmake --build build-wasm -j10
+cmake --build build-wasm-rel -j10
 ```
 
 `mm.o2r` is not built in and not built here: produce it from a ROM with a desktop build and

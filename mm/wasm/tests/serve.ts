@@ -17,4 +17,4 @@ console.log("");
 console.log(`  ${server.url}/host.html            play`);
 console.log(`  ${server.url}/host.html?memtrace   play, with the memory trace`);
 console.log("");
-console.log("Rebuild with `cmake --build build-wasm -j10` and reload; nothing is cached. Ctrl+C stops.");
+console.log("Rebuild with `cmake --build build-wasm-rel -j10` and reload; nothing is cached. Ctrl+C stops.");

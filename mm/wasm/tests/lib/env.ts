@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 export const TESTS_DIR = resolve(import.meta.dir, "..");
 export const REPO_DIR = resolve(TESTS_DIR, "../../..");
 
-export const BUILD_DIR = resolve(process.env.SHIP_WASM_BUILD ?? join(REPO_DIR, "build-wasm/mm"));
+export const BUILD_DIR = resolve(process.env.SHIP_WASM_BUILD ?? join(REPO_DIR, "build-wasm-rel/mm"));
 export const FILES_DIR = resolve(process.env.SHIP_WASM_FILES ?? join(BUILD_DIR, "hostfiles"));
 
 export const SLOW = process.env.SHIP_WASM_SLOW === "1";

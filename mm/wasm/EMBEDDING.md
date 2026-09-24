@@ -23,12 +23,12 @@ Then the wasm build (emsdk 6.0.9):
 
 ```
 source ~/emsdk/emsdk_env.sh
-emcmake cmake -H. -Bbuild-wasm -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+emcmake cmake -H. -Bbuild-wasm-rel -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
   -DSHIP_WASM_ASSET_DIR=$PWD/build-cmake/mm
-cmake --build build-wasm -j10
+cmake --build build-wasm-rel -j10
 ```
 
-Outputs, in `build-wasm/mm`:
+Outputs, in `build-wasm-rel/mm`:
 
 | | |
 |---|---|

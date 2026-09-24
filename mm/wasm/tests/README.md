@@ -18,11 +18,11 @@ bun run smoke                  # just the smoke tests
 A release build and a game archive:
 
 ```
-SHIP_WASM_BUILD=/path/to/build-wasm/mm        # 2ship.js, 2ship.wasm, 2ship.data, host.html
+SHIP_WASM_BUILD=/path/to/build-wasm-rel/mm    # 2ship.js, 2ship.wasm, 2ship.data, host.html
 SHIP_WASM_FILES=$SHIP_WASM_BUILD/hostfiles    # mm.o2r, 2ship2harkinian.json
 ```
 
-Both default to `build-wasm/mm` and `build-wasm/mm/hostfiles` in the repo. `mm.o2r` must come
+Both default to `build-wasm-rel/mm` and `build-wasm-rel/mm/hostfiles` in the repo. `mm.o2r` must come
 from the same build as the binary — the archive records the port version and the game refuses
 one from another build, which the boot tests rely on.
 
