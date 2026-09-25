@@ -116,11 +116,37 @@ config it hands in. This is the game's own Developer Tools > Warp Points feature
 - `gEnhancements.Cutscenes.SkipToFileSelect` must be 0 or absent; with it on, the warp point is
   ignored.
 
-What the boot gives you is **a new game, not a save**: day 1, 8:00, human form, three
-hearts, the Kokiri Sword and no other items, and first-cycle story flags
-(`Sram_InitNewSave`). There is no way yet to choose the day, the time or the form. The host
-sees `load-game` with `fileNum: 255`, then `scene`, and from then on play-state commands
-work.
+What the boot gives you is **a new game, not a save**, always on day 1 at 8:00 in human form;
+there is no way yet to choose the day, the time or the form. The host sees `load-game` with
+`fileNum: 255`, then `scene`, and from then on play-state commands work.
+
+By default that new game is empty: three hearts, the Kokiri Sword and no other items, and no
+story flags (`Sram_InitNewSave`). With none set, first-visit cutscenes play on arrival;
+booting into South Clock Town starts the clock tower door's, with Tatl, which runs for a
+while. To start on the debug save instead, set two CVars beside the warp point:
+
+```json
+"CVars": { "gDeveloperTools": { "DebugEnabled": 1, "DebugSaveFileMode": 1 } }
+```
+
+| `DebugSaveFileMode` | Starts with |
+|---|---|
+| `0` | The empty new game above. |
+| `1` | The vanilla debug save: eight hearts, the ocarina, bow, bottles and every mask, the transformation masks included, and three story flags, among them the one behind the clock tower door's cutscene. **Recommended**: a scene looks as it does on a first visit. |
+| `2` | The debug save made a 100% save: twenty hearts, the Gilded Sword and Mirror Shield, full upgrades and maps, and every story flag a three-day reset keeps. Some scenes spawn different actors once their story flags are set, so the game may not show the scene as it looks on a first visit. |
+
+The mode is applied through the `OnSaveInit` hook, which the boot fires
+(`RegisterDebugSaveCreate` in `mm/2s2h/DeveloperTools/DeveloperTools.cpp`). It needs
+`DebugEnabled`: with that off the game clears `DebugSaveFileMode` at boot
+(`RegisterDebugMode`, same file). `DebugEnabled` also turns on the debug button combinations: Z+L+R opens map
+select, L+D-Right toggles noclip, R+D-Down toggles frame advance, and L on the pause screen
+opens the inventory editor.
+
+The debug save covers the three flags it sets and no others. The scripted cutscenes a spawn
+triggers on arrival should not play on this boot, because the warp respawns the player and
+those only run on an ordinary entry (`Cutscene_HandleEntranceTriggers` in
+`mm/src/code/z_demo.c`), but they can play after a later `entrance` command or a door.
+`gEnhancements.Cutscenes.SkipEntranceCutscenes: 1` skips those as well.
 
 A config written with no `ConfigVersion` that still carries the legacy
 `gDeveloperTools.WarpPoint.*` CVars from an old desktop install has those migrated at boot into
